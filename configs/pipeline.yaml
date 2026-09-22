@@ -1,0 +1,47 @@
+# CAMS 汇流感知多断面预报模型 —— 运行配置
+# 换流域时改本文件与 configs/sites_*.csv 两份即可。
+
+basin:
+  name: french_broad
+  # 降水网格覆盖范围与分辨率（等经纬度，单位：度）
+  lat_min: 35.065
+  lat_max: 36.335
+  lon_min: -83.485
+  lon_max: -82.215
+  grid: 128            # 网格边长（格）
+  step: 0.01           # 网格步长（度），0.01 度约合 1 公里
+
+period:
+  start: "2023-01-01"
+  end: "2024-12-31"
+
+paths:
+  sites: data/sites                 # 各断面流量 CSV
+  sites_csv: configs/sites_french_broad.csv
+  dem30: data/dem30                 # 30 米高程图幅
+  terrain: data/terrain30.npz
+  catchments: data/catchments.npz
+  area_rain: data/area_rain.npz
+  rain_nc: data/rain_mrms_1km.nc
+  out_dir: runs/site_model
+
+model:
+  lookback: 72          # 历史窗口（小时）
+  horizon: 24           # 预见期（小时）
+  stride: 24            # 训练集抽样步长
+  split: [0.7, 0.15, 0.15]
+  hidden: 96
+  spatial_dim: 48
+  batch_size: 128
+  epochs: 40
+  lr: 0.001
+  patience: 12
+  seed: 42
+  cum_hours: [1, 3, 6, 12, 24, 72]   # 累积降雨的时间尺度（小时）
+  use_spatial: true      # 空间分支（降雨图 + 静态场）
+  use_future_rain: true  # 预见期内的降雨
+  use_site: false        # 断面属性标量（实测无增益，默认关闭）
+
+fetch:
+  rain_threads: 8              # 降水下载并发
+  rain_checkpoint_hours: 96    # 断点续传检查间隔（小时）

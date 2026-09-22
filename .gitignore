@@ -1,0 +1,20 @@
+# 原始/中间数据：体积大（约 1.4G），可由 scripts/fetch_*.py 重新拉取
+data/
+
+# 训练产物与日志
+runs/
+
+# 大体积图件（保留 png/pdf/svg 轻量版本）
+experiments/**/*.tiff
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
