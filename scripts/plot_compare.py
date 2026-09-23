@@ -88,10 +88,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="experiments/forecast_compare")
     ap.add_argument("--sites", default=None, help="逗号分隔站号，默认全部")
+    ap.add_argument("--models", default="all",
+                    help="all=全部模型；best=仅最佳模型 C.9；或逗号分隔的行标签过滤")
     args = ap.parse_args()
 
+    models = MODELS
+    if args.models == "best":
+        models = [m for m in MODELS if m[0].startswith("C.9")]
+    elif args.models != "all":
+        want = set(args.models.split(","))
+        models = [m for m in MODELS if m[0] in want]
+
     runs = []
-    for lab, rd, col in MODELS:
+    for lab, rd, col in models:
         if os.path.isfile(os.path.join(ROOT, rd, "predictions.npz")):
             runs.append((lab, load_run(rd), col))
         else:
@@ -123,7 +132,7 @@ def main():
         idx = [i for i in idx if ids[i] in want]
 
     for i in idx:
-        ref = runs[3][1]  # 用 C.4 gstd 的样本取窗口（各 run 样本一致）
+        ref = runs[0][1]  # 用首个可用 run 的样本取窗口（各 run 样本一致）
         t0s = ref["t0"][ref["site"] == i]
         q_raw = flows[ids[i]]
         wins = pick_windows(q_raw, t0s)
@@ -131,11 +140,17 @@ def main():
         full_nse = [site_full_nse(d, i) for _, d, _ in runs]
 
         fig, axes = plt.subplots(len(runs), len(wins),
-                                 figsize=(5.2 * len(wins), 2.35 * len(runs) + 0.6))
-        fig.subplots_adjust(left=0.09, right=0.98, top=0.93, bottom=0.07,
-                            hspace=0.55, wspace=0.14)
+                                 figsize=(5.2 * len(wins),
+                                          3.8 if len(runs) == 1
+                                          else 2.35 * len(runs) + 0.6))
+        fig.subplots_adjust(left=0.09, right=0.98,
+                            top=0.80 if len(runs) == 1 else 0.93,
+                            bottom=0.07, hspace=0.55, wspace=0.14)
         if len(wins) == 1:
             axes = axes[:, None]
+        axes = np.asarray(axes)
+        if axes.ndim == 1:  # 单模型时 subplots 返回一维
+            axes = axes[None, :]
 
         for r, (lab, d, col) in enumerate(runs):
             for cwt, (t0, wlab) in enumerate(wins):
@@ -183,8 +198,10 @@ def main():
         axes[0, 0].legend(loc="upper left", fontsize=7, ncol=3)
         fig.text(0.995, 0.5, "绿=面雨量 mm/h", rotation=90, va="center",
                  fontsize=8, color="#4dac26")
+        who = (f"最佳模型 {runs[0][0]}" if len(runs) == 1
+               else f"{len(runs)} 模型")
         fig.suptitle(f"{ids[i]} {names[i]}  {areas[i]:.0f} km²  "
-                     f"测试段代表窗口 × {len(runs)} 模型", fontsize=12)
+                     f"测试段代表窗口 × {who}", fontsize=12)
         out = os.path.join(out_dir, f"{ids[i]}_{names[i]}.png")
         fig.savefig(out, dpi=110)
         plt.close(fig)
