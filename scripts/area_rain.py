@@ -26,25 +26,29 @@ def main():
     p = cfg["paths"]
 
     d = np.load(os.path.join(ROOT, p["catchments"]), allow_pickle=True)
-    mask = d["mask1km"].astype(np.float64)
+    mask = d["mask1km"].astype(np.float32)
     ids = [str(x) for x in d["site_ids"]]
     names = [str(x) for x in d["names"]]
     areas = d["area_obs"]
 
     ds = xr.open_dataset(os.path.join(ROOT, p["rain_nc"]))
-    rain = ds["rain"].values.astype(np.float64)
+    rain = ds["rain"].values.astype(np.float32)
     times = pd.DatetimeIndex(ds.time.values)
+    T = len(times)
     print(f"降水 {rain.shape}  {times[0]} ~ {times[-1]}  断面 {len(ids)} 个")
 
+    # 时间轴长（八万余小时）时，逐断面展开浮点临时数组会吃掉上百 GB，
+    # 改成一次性矩阵乘：把格点摊平，用掩膜权重直接投影到各断面。
     finite = np.isfinite(rain)
-    filled = np.where(finite, rain, 0.0)
-    area_rain = np.full((len(ids), len(times)), np.nan)
-    for i in range(len(ids)):
-        w = mask[i]
-        wt = (finite * w[None]).sum(axis=(1, 2))
-        num = (filled * w[None]).sum(axis=(1, 2))
-        ok = wt > 0
-        area_rain[i, ok] = num[ok] / wt[ok]
+    F = finite.reshape(T, -1).astype(np.float32)
+    V = np.where(finite, rain, 0.0).reshape(T, -1)
+    del finite
+    W = mask.reshape(len(ids), -1).T            # (格点, 断面)
+    wt = F @ W                                  # (T, 断面) 有效权重
+    num = V @ W                                 # (T, 断面) 加权和
+    del F, V, rain
+    ok = wt > 0
+    area_rain = np.where(ok, num / np.where(ok, wt, 1.0), np.nan).T  # (断面, T)
 
     print(f"面雨量 {area_rain.shape}  {np.nanmin(area_rain):.2f}~{np.nanmax(area_rain):.2f} 毫米/小时")
     out = os.path.join(ROOT, p["area_rain"])

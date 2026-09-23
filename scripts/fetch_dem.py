@@ -19,6 +19,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = "https://s3.amazonaws.com/elevation-tiles-prod/skadi/{band}/{tile}.hgt.gz"
 
 
+def make_opener(proxy=None):
+    """带代理的 urlopen 包装；proxy 为空则直连（仍尊重 HTTP(S)_PROXY 环境变量）。"""
+    if proxy:
+        h = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        return urllib.request.build_opener(h)
+    return urllib.request.build_opener()
+
+
 def tiles_for(lat_min, lat_max, lon_min, lon_max):
     """返回覆盖该范围的所有 SRTM 图幅名。"""
     out = []
@@ -38,6 +46,7 @@ def main():
         cfg = yaml.safe_load(f)
 
     b = cfg["basin"]
+    opener = make_opener(cfg["fetch"].get("proxy") or None)
     out_dir = os.path.join(ROOT, cfg["paths"]["dem30"])
     os.makedirs(out_dir, exist_ok=True)
 
@@ -52,7 +61,7 @@ def main():
             continue
         url = BASE.format(band=t[:3], tile=t)
         try:
-            raw = urllib.request.urlopen(url, timeout=300).read()
+            raw = opener.open(url, timeout=300).read()
             data = gzip.decompress(raw)
             if len(data) != 3601 * 3601 * 2:
                 raise ValueError(f"解压后大小 {len(data)} 不符，应为 {3601 * 3601 * 2}")

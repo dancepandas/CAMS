@@ -18,15 +18,45 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFS_TO_CMS = 0.028316846592
 
 
+def fetch_chunked(nwis, sid, start, end, chunk_years):
+    """按年分段取瞬时流量再拼接。
+
+    一次要十年会超时（实测 9.5 年单请求读到超时，五年以内正常），故分段取。
+    """
+    parts = []
+    a = pd.Timestamp(start)
+    b = pd.Timestamp(end)
+    while a <= b:
+        z = min(a + pd.DateOffset(years=chunk_years) - pd.Timedelta(seconds=1), b)
+        # USGS 只吃日期（带时间分量的 startDT 会返回 400）
+        df, _ = nwis.get_iv(sites=sid, start=a.strftime("%Y-%m-%d"),
+                            end=z.strftime("%Y-%m-%d"), parameterCd="00060")
+        if len(df):
+            cols = [c for c in df.columns if "00060" in c and not c.endswith("_cd")]
+            if not cols:
+                raise RuntimeError(f"未找到 00060 列，实际 {list(df.columns)[:6]}")
+            parts.append(df[cols[0]].astype(float))
+        a = z + pd.Timedelta(seconds=1)
+    if not parts:
+        return pd.Series(dtype=float)
+    q = pd.concat(parts)
+    return q[~q.index.duplicated(keep="last")].sort_index()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/pipeline.yaml")
     ap.add_argument("--start", default=None, help="覆盖配置中的起始日期")
     ap.add_argument("--end", default=None, help="覆盖配置中的结束日期")
+    ap.add_argument("--chunk-years", type=int, default=3,
+                    help="单次请求覆盖的年数（太大 USGS 会超时）")
     args = ap.parse_args()
     with open(os.path.join(ROOT, args.config), encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    proxy = (cfg["fetch"].get("proxy") or "").strip()
+    if proxy:                       # dataretrieval 走 requests，靠环境变量识别代理
+        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
     from dataretrieval import nwis
 
     sites = pd.read_csv(os.path.join(ROOT, cfg["paths"]["sites_csv"]),
@@ -41,12 +71,9 @@ def main():
     for _, row in sites.iterrows():
         sid, name = str(row["site_id"]), str(row["name"])
         try:
-            df, _ = nwis.get_iv(sites=sid, start=start, end=end, parameterCd="00060")
-            cols = [c for c in df.columns if "00060" in c and not c.endswith("_cd")]
-            if not cols:
-                raise RuntimeError(f"未找到 00060 列，实际 {list(df.columns)[:6]}")
-            q = df[cols[0]].astype(float) * CFS_TO_CMS
-            q = q[~q.index.duplicated(keep="last")].sort_index()
+            q = fetch_chunked(nwis, sid, start, end, args.chunk_years) * CFS_TO_CMS
+            if q.empty:
+                raise RuntimeError("接口未返回任何数据")
             hourly = q[q.index.minute == 0]
             if hourly.empty:
                 print(f"{sid:11s} {name:10s} 无整点数据")
