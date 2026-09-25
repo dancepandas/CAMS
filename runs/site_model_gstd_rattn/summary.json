@@ -1,0 +1,10 @@
+{
+  "nse_median": 0.7825186037883796,
+  "nse_persist_median": 0.7791397412064971,
+  "nse_win": 9,
+  "kge_median": 0.8440043759318441,
+  "kge_persist_median": 0.790040444869844,
+  "kge_win": 2,
+  "n_sites": 15,
+  "nse_peak": 0.9274812916129069
+}

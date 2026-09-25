@@ -70,31 +70,18 @@ def load_inputs(cfg):
 
 
 def build_statics(cfg, mask1km):
-    """每个断面的静态场：汇水区掩膜、对数汇流累积、坡度、高程。"""
-    p = cfg["paths"]
-    G = int(cfg["basin"]["grid"])
-    t = np.load(os.path.join(ROOT, p["terrain"]))
-    up, slope, elev = t["uparea"], t["slope"], t["elevtn"]
-    step = min(up.shape[0] // G, up.shape[1] // G)
-    nr, nc = G * step, G * step
-    agg = lambda a: a[:nr, :nc].reshape(G, step, G, step).mean(axis=(1, 3))
-
-    static = np.stack([np.log1p(agg(up)) / 5.0, agg(slope) / 45.0,
-                       (agg(elev) - 900.0) / 500.0])[None]
-    static = static.repeat(len(mask1km), axis=0)
-    statics = np.concatenate([mask1km[:, None], static], axis=1)
-    return statics.astype(np.float32)
+    """每个断面的汇水区掩膜：输入前用它裁剪降雨图（掩膜外归零）。"""
+    return mask1km[:, None].astype(np.float32)
 
 
 class SiteDataset(Dataset):
     """按需组装空间输入，避免把全部样本预先展开成巨大数组。"""
 
-    def __init__(self, cs, statics, flow_n, rain_n, samples, cum_hours,
+    def __init__(self, cs, statics, flow_n, rain_n, samples,
                  use_spatial, use_future, horizon, lookback, weights=None):
         self.cs, self.statics = cs, statics
         self.flow_n, self.rain_n = flow_n, rain_n
         self.samples = np.asarray(samples, dtype=np.int64)  # (n, 2) 便于整批索引
-        self.cum_hours = cum_hours
         self.use_spatial, self.use_future = use_spatial, use_future
         self.horizon, self.lookback = horizon, lookback
         # 样本级损失权重（如逐站方差归一化）；默认 1 不改变行为
@@ -112,44 +99,40 @@ class SiteDataset(Dataset):
         delta = tgt - hist[-1]
 
         if self.use_spatial:
-            # cs 在 GPU 常驻时按通道手工堆叠，避免把整张累积雨图转成 numpy；
-            # 仍走 numpy 路径时先一次性取回 GPU 切片，减少反复传输。
+            # 空间支路：汇水区掩膜裁剪后的两张图——最近 1h 降雨、72h 平均雨强；
+            # 预见期支路：同一张降雨图在预见期内的部分（裁剪）。
+            # cs 为降雨图的逐时累积（cs[t]-cs[t-1] 即 t 时刻降雨图），GPU 常驻。
+            m = self.statics[i, 0]                          # 汇水区掩膜
             if torch.is_tensor(self.cs):
-                chans = []
-                for h in self.cum_hours:
-                    lo = max(0, t - h + 1)
-                    base = self.cs[lo - 1] if lo > 0 else 0.0
-                    chans.append(((self.cs[t] - base) / (t - lo + 1)).unsqueeze(0))
-                sp = torch.cat(chans, dim=0)                       # (n_cum, G, G)
-                st = self.statics[i]
-                x = torch.cat([sp.to(st.device), st], dim=0)
-                x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-                return (x,
-                        torch.tensor(np.stack([hist, self.rain_n[i, t0:t0 + self.lookback]], axis=-1),
-                                     dtype=torch.float32),
-                        torch.tensor(self.rain_n[i, t0 + self.lookback:t0 + self.lookback + self.horizon],
-                                     dtype=torch.float32),
-                        i,
-                        torch.tensor(delta, dtype=torch.float32),
-                        self.weights[k])
-            cs_t = self.cs[t]
-            chans = []
-            for h in self.cum_hours:
-                lo = max(0, t - h + 1)
+                rnow = self.cs[t] - (self.cs[t - 1] if t > 0 else 0.0)
+                lo = max(0, t - 71)
                 base = self.cs[lo - 1] if lo > 0 else 0.0
-                chans.append((cs_t - base) / (t - lo + 1))
-            x = np.concatenate([np.stack(chans), self.statics[i]], axis=0)
+                avg72 = (self.cs[t] - base) / (t - lo + 1)
+                x = torch.stack([rnow * m, avg72 * m])
+                fut = ((self.cs[t + self.horizon] - self.cs[t]) * m
+                       if self.use_future else torch.zeros_like(rnow))
+                x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                fut = torch.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
+                return (x,
+                        torch.tensor(hist[:, None], dtype=torch.float32),
+                        fut.unsqueeze(0),
+                        i, torch.tensor(delta, dtype=torch.float32),
+                        self.weights[k])
+            rnow = self.cs[t] - (self.cs[t - 1] if t > 0 else 0.0)
+            lo = max(0, t - 71)
+            base = self.cs[lo - 1] if lo > 0 else 0.0
+            avg72 = (self.cs[t] - base) / (t - lo + 1)
+            x = np.stack([rnow * m, avg72 * m])
+            fut = ((self.cs[t + self.horizon] - self.cs[t]) * m
+                   if self.use_future else np.zeros_like(rnow))
             x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            fut = np.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             x = np.zeros((1, 1, 1), dtype=np.float32)
-
-        hrain = self.rain_n[i, t0:t0 + self.lookback]
-        frain = self.rain_n[i, t0 + self.lookback:t0 + self.lookback + self.horizon]
-        if not self.use_future:
-            frain = np.zeros_like(frain)
+            fut = np.zeros((1, 1), dtype=np.float32)
         return (torch.tensor(x, dtype=torch.float32),
-                torch.tensor(np.stack([hist, hrain], axis=-1), dtype=torch.float32),
-                torch.tensor(frain, dtype=torch.float32),
+                torch.tensor(hist[:, None], dtype=torch.float32),
+                torch.tensor(fut, dtype=torch.float32),
                 i, torch.tensor(delta, dtype=torch.float32),
                 self.weights[k])
 
@@ -169,24 +152,34 @@ def make_loader(ds, batch_size, shuffle, device, num_workers=0):
 
 
 class Net(nn.Module):
-    def __init__(self, n_spatial_ch, n_cum, use_spatial, use_site, hidden,
+    def __init__(self, use_spatial, use_site, hidden,
                  spatial_dim, horizon, att_heads=0, att_mode="cat",
                  att_excl=False, n_site=0, tok_dim=8, use_feat=False,
-                 areas=None):
+                 areas=None, n_quant=1):
         super().__init__()
         self.use_spatial, self.use_site = use_spatial, use_site
-        self.n_cum = n_cum          # 掩膜通道在空间输入中的下标
+        self.horizon = horizon
+        # 多分位数输出：forward 返回 (B, horizon, n_quant)，取中位分位点作点预报
+        self.n_quant = n_quant
+        self.mid = n_quant // 2
         if use_spatial:
             self.cnn = nn.Sequential(
-                nn.Conv2d(n_spatial_ch, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(2, 16, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Conv2d(16, 24, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Conv2d(24, 32, 3, stride=2, padding=1), nn.ReLU(),
             )
             self.proj = nn.Linear(32, spatial_dim)
+            # 预见期降雨图（单通道）独立小卷积，各自投影后拼接
+            self.fut_cnn = nn.Sequential(
+                nn.Conv2d(1, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 24, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(24, 32, 3, stride=2, padding=1), nn.ReLU(),
+            )
+            self.fproj = nn.Linear(32, spatial_dim)
         # 物理锚定的静态特征：log(面积/全域中位面积)，每时刻随行输入，
         # 同一函数作用于所有站（全局变换，无站点拟合参数），可迁移到新站。
         self.use_feat = use_feat
-        in_dim = 2
+        in_dim = 1                                    # 仅流量
         if use_feat:
             med = float(np.median(areas))
             self.register_buffer(
@@ -198,16 +191,15 @@ class Net(nn.Module):
             self.site_emb = nn.Embedding(n_site, tok_dim)   # 编码历史时即带站点身份
             self.tok_dim = tok_dim
             in_dim += tok_dim
-        self.lstm = nn.LSTM(in_dim, hidden, batch_first=True)  # 历史流量与历史面雨量
-        self.lstm_f = nn.LSTM(1, 32, batch_first=True)       # 预见期内的面雨量
+        self.lstm = nn.LSTM(in_dim, hidden, batch_first=True)  # 历史流量
         self.att, self.att_mode, self.att_excl = None, att_mode, att_excl
         if att_heads:           # 历史支路自注意力：末态作查询，检索相似历史片段
             self.att = nn.MultiheadAttention(hidden, att_heads, batch_first=True)
         hist_dim = hidden * (2 if (self.att is not None and att_mode == "cat") else 1)
-        fused = (hist_dim + (spatial_dim if use_spatial else 0)
-                 + (3 if use_site else 0) + 32)
+        fused = (hist_dim + (2 * spatial_dim if use_spatial else 0)
+                 + (3 if use_site else 0))
         self.head = nn.Sequential(nn.Linear(fused, 96), nn.ReLU(),
-                                  nn.Linear(96, horizon))
+                                  nn.Linear(96, horizon * n_quant))
 
     def forward(self, x, hist, frain, site):
         B, T, _ = hist.shape
@@ -223,7 +215,7 @@ class Net(nn.Module):
             body = torch.cat([hist] + consts, dim=-1)
             firsts = [tok_first if (tok_first is not None and j == len(consts) - 1)
                       else c[:, :1] for j, c in enumerate(consts)]
-            row0 = torch.cat([torch.zeros(B, 1, 2, device=hist.device,
+            row0 = torch.cat([torch.zeros(B, 1, hist.shape[-1], device=hist.device,
                                           dtype=hist.dtype)] + firsts, dim=-1)
             out, (h, _) = self.lstm(torch.cat([row0, body], dim=1))
         else:
@@ -241,19 +233,19 @@ class Net(nn.Module):
                 feats = [torch.cat([h[-1], ctx], dim=-1)]
         else:
             feats = [h[-1]]
-        _, (hf, _) = self.lstm_f(frain.unsqueeze(-1))
-        feats.append(hf[-1])
         if self.use_spatial:
+            # 历史态两张图（当前 1h + 72h 平均）与预见期降雨图（下一小时）各自卷积
             f = self.cnn(x)
-            # 掩膜排在累积降雨之后，用它在汇水区内做加权池化
-            m = torch.nn.functional.adaptive_avg_pool2d(
-                x[:, self.n_cum:self.n_cum + 1], f.shape[-2:])
-            w = m.clamp(min=0)
-            pooled = (f * w).sum(dim=(2, 3)) / w.sum(dim=(2, 3)).clamp(min=1e-6)
+            pooled = torch.nn.functional.adaptive_avg_pool2d(f, 1).flatten(1)
             feats.append(self.proj(pooled))
+            if frain is not None:
+                ff = self.fut_cnn(frain)
+                fp = torch.nn.functional.adaptive_avg_pool2d(ff, 1).flatten(1)
+                feats.append(self.fproj(fp))
         if self.use_site and site is not None and site.dim() > 1:
             feats.append(site)
-        return self.head(torch.cat(feats, dim=-1))
+        out = self.head(torch.cat(feats, dim=-1))
+        return out.view(B, self.horizon, self.n_quant)
 
 
 def nse(obs, sim):
@@ -313,11 +305,124 @@ def make_inv(transform, q_mean, q_std, lams):
     return lambda z, i: np.expm1(np.asarray(z) * q_std[i] + q_mean[i])
 
 
+def unrolled_loss(model, idx, t0, flow_g, cs_g, st_g, w, K, lookback,
+                  use_spatial, use_future, ar, delta):
+    """把模型自己的预测喂回历史窗，滚动 K 步，返回每步损失均值（E1 加权）。
+
+    与推理滚动完全同构：除起报窗外不用实测流量；损失打在滚动每一步上，
+    涨水过程的每一步都有梯度，教师强迫的曝光偏差由此根治。
+    """
+    cur = flow_g[idx[:, None], t0[:, None] + ar[None, :]].clone()   # (B, LB)
+    tot = 0.0
+    for k in range(K):
+        t = t0 + lookback - 1 + k                                   # 当前末刻 (B,)
+        if use_spatial:
+            mk = st_g[idx][:, 0]                                    # (B,G,G) 汇水区掩膜
+            rnow = cs_g[t] - cs_g[t - 1]
+            lo = (t - 71).clamp_min(0)
+            base = cs_g[(lo - 1).clamp_min(0)] * (lo > 0).float()[:, None, None]
+            avg72 = (cs_g[t] - base) / (t - lo + 1).float()[:, None, None]
+            x = torch.stack([rnow * mk, avg72 * mk], 1)             # (B,2,G,G)
+            fut = ((cs_g[t + 1] - cs_g[t]) * mk).unsqueeze(1)       # 下一小时降雨图
+            if not use_future:
+                fut = torch.zeros_like(fut)
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            fut = torch.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            x = torch.zeros((len(idx), 1, 1, 1), device=flow_g.device)
+            fut = None
+        hist = cur.unsqueeze(-1)                                    # (B,LB,1) 仅流量
+        d_pred = model(x, hist, fut, idx)[:, 0, model.mid]          # 中位分位点
+        y = flow_g[idx, t + 1] - flow_g[idx, t]                     # 真值增量（锚定实测末刻）
+        l = nn.functional.huber_loss(d_pred, y, delta=delta, reduction="none")
+        tot = tot + (l * w).sum() / w.sum()
+        nxt = cur[:, -1] + d_pred
+        cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)
+    return tot / K
+
+
+def train_model_unrolled(model, ds_tr, ds_va, m, out_dir, device):
+    """展开式训练：训练/验证都在滚动条件下算损失，选模型与推理任务一致。"""
+    K = int(m["unroll"])
+    lookback = ds_tr.lookback
+    use_spatial, use_future = ds_tr.use_spatial, ds_tr.use_future
+    delta = float(m.get("huber_delta", 1.0))
+    bs, epochs = int(m["batch_size"]), int(m["epochs"])
+    opt = torch.optim.Adam(model.parameters(), lr=float(m["lr"]))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    ar = torch.arange(lookback, device=device)
+    flow_tr = torch.from_numpy(np.nan_to_num(ds_tr.flow_n, nan=0.0)).float().to(device)
+    flow_va = torch.from_numpy(np.nan_to_num(ds_va.flow_n, nan=0.0)).float().to(device)
+    w_all = torch.as_tensor(ds_tr.weights, device=device)
+    sam_tr = torch.as_tensor(ds_tr.samples, device=device)          # (n,2) 站号, t0
+    sam_va = torch.as_tensor(ds_va.samples, device=device)
+    cs_tr, st_tr = ds_tr.cs, ds_tr.statics                          # make_loader 已挪 GPU
+    cs_va, st_va = ds_va.cs, ds_va.statics
+    print(f"展开式训练 unroll={K}：滚动 {K} 步逐步回灌，损失打在每步上"
+          f"（训练加权、验证不加权）")
+
+    def run_train():
+        model.train(True)
+        perm = torch.randperm(len(sam_tr), device=device)
+        tot, n = 0.0, 0
+        for j in range(0, len(sam_tr), bs):
+            sel = perm[j:j + bs]
+            s = sam_tr[sel]
+            loss = unrolled_loss(model, s[:, 0], s[:, 1], flow_tr, cs_tr, st_tr,
+                                 w_all[sel], K, lookback, use_spatial,
+                                 use_future, ar, delta)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tot += loss.item() * len(sel)
+            n += len(sel)
+        return tot / max(n, 1)
+
+    def run_val():
+        model.train(False)
+        tot, n = 0.0, 0
+        with torch.no_grad():
+            for j in range(0, len(sam_va), bs):
+                s = sam_va[j:j + bs]
+                w = torch.ones(len(s), device=device)
+                loss = unrolled_loss(model, s[:, 0], s[:, 1], flow_va, cs_va, st_va,
+                                     w, K, lookback, use_spatial, use_future,
+                                     ar, delta)
+                tot += loss.item() * len(s)
+                n += len(s)
+        return tot / max(n, 1)
+
+    best, best_state, wait = np.inf, None, 0
+    for ep in range(1, epochs + 1):
+        tr = run_train()
+        sched.step()
+        va = run_val()
+        if va < best:
+            best, wait = va, 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            wait += 1
+        if ep % 5 == 0 or ep == 1:
+            print(f"  第 {ep:3d} 轮  训练 {tr:.4f}  验证 {va:.4f}")
+        if wait >= int(m["patience"]):
+            print(f"  第 {ep} 轮早停")
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    torch.save(model.state_dict(), os.path.join(out_dir, "best.pt"))
+
+
 def train_model(model, ldr, m, out_dir, device):
     opt = torch.optim.Adam(model.parameters(), lr=float(m["lr"]))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(m["epochs"]))
     loss_name = str(m.get("loss", "mse"))
-    if loss_name == "huber_nse":
+    if loss_name == "quantile":
+        taus = torch.tensor([float(v) for v in m.get("quantiles", [0.1, 0.5, 0.9])],
+                            device=device)
+        qs = "/".join(f"{float(v):g}" for v in m.get("quantiles", [0.1, 0.5, 0.9]))
+        print(f"损失 quantile（τ={qs}，pinball，逐站方差归一加权，仅训练）")
+    elif loss_name == "huber_nse":
         # E1：Huber(reduction='none') × 样本权重（逐站方差归一），训练批加权、验证不加权
         delta = float(m.get("huber_delta", 1.0))
         print(f"损失 huber_nse（delta={delta}，逐站方差归一加权，仅训练）")
@@ -335,13 +440,20 @@ def train_model(model, ldr, m, out_dir, device):
             x, hist, frain, idx, y = (t.to(device, non_blocking=True)
                                       for t in (x, hist, frain, idx, y))
             w = w.to(device, non_blocking=True)
-            pred = model(x, hist, frain, idx)
+            pred = model(x, hist, frain, idx)          # (B, H, K)
+            if loss_name == "quantile":
+                err = pred - y.unsqueeze(-1)           # (B, H, K)
+                l = torch.maximum(taus * err, (taus - 1) * err)
+                l = l.mean(dim=tuple(range(1, l.ndim)))
+                loss = (l * w).sum() / w.sum() if train else l.mean()
+            else:
+                pred = pred.squeeze(-1)                # (B, H)，单分位点
             if loss_name == "huber_nse":
                 l = nn.functional.huber_loss(pred, y, delta=delta, reduction="none")
                 # 空间平均到样本级，与权重逐样本相乘
                 l = l.mean(dim=tuple(range(1, l.ndim)))
                 loss = (l * w).sum() / w.sum() if train else l.mean()
-            else:
+            elif loss_name != "quantile":
                 loss = lossf(pred, y)
             if train:
                 opt.zero_grad()
@@ -383,8 +495,11 @@ def main():
 
     m = cfg["model"]
     lookback, horizon = int(m["lookback"]), int(m["horizon"])
+    # rollout>0：单步模型（horizon=1）推理时递归滚动，把预报喂回历史窗口，
+    # 逐步推出 rollout 小时；R 为评估/抽样用的实际预见期。
+    rollout = int(m.get("rollout", 0))
+    R = rollout or horizon
     stride, split = int(m["stride"]), list(m["split"])
-    cum_hours = [int(h) for h in m["cum_hours"]]
     use_spatial, use_future, use_site = (bool(m["use_spatial"]),
                                          bool(m["use_future_rain"]),
                                          bool(m.get("use_site", False)))
@@ -408,11 +523,23 @@ def main():
         cs = np.nan_to_num(rain_grid.astype(np.float32), nan=0.0).cumsum(axis=0)
         print(f"累积降雨数组 {cs.shape}  {cs.nbytes / 1e9:.2f} GB")
 
-    n_win = T - lookback - horizon + 1
-    n_tr = int(n_win * split[0])
-    n_va = int(n_win * split[1])
-    bounds = {"train": (0, n_tr), "val": (n_tr, n_tr + n_va),
-              "test": (n_tr + n_va, n_win)}
+    n_win = T - lookback - R + 1
+    sd = m.get("split_dates")
+    if sd:
+        # 按日期切分（围绕洪水事件设计）：train < sd[0] ≤ val < sd[1] ≤ test
+        b1 = int(times.searchsorted(pd.Timestamp(sd[0])))
+        b2 = int(times.searchsorted(pd.Timestamp(sd[1])))
+        b1 = min(max(b1, 1), n_win - 1)
+        b2 = min(max(b2, b1 + 1), n_win)
+        bounds = {"train": (0, b1), "val": (b1, b2), "test": (b2, n_win)}
+        print(f"按日期划分  train 至 {times[b1]}  |  val 至 {times[b2]}  |  "
+              f"test 至 {times[-1]}")
+    else:
+        n_tr = int(n_win * split[0])
+        n_va = int(n_win * split[1])
+        bounds = {"train": (0, n_tr), "val": (n_tr, n_tr + n_va),
+                  "test": (n_tr + n_va, n_win)}
+    n_tr = bounds["train"][1]      # 变换统计只用训练段
 
     # 非线性变换只做全局一份（各断面共用同一个 log / YJ lambda，或干脆不做），
     # 避免逐站拟合带来的站点特异性和逆变换损失；之后统一逐站线性标准化，
@@ -462,13 +589,13 @@ def main():
 
     samples = {}
     for sp, (lo, hi) in bounds.items():
-        step = stride if sp == "train" else horizon
+        step = stride if sp == "train" else R
         ss = []
         for i in range(n_site):
             for t0 in range(lo, hi, step):
                 h = flow_n[i, t0:t0 + lookback]
-                y = flow_n[i, t0 + lookback:t0 + lookback + horizon]
-                r = rain_n[i, t0:t0 + lookback + horizon]
+                y = flow_n[i, t0 + lookback:t0 + lookback + R]
+                r = rain_n[i, t0:t0 + lookback + R]
                 if (np.isfinite(h).all() and np.isfinite(y).all()
                         and np.isfinite(r).all()):
                     ss.append((i, t0))
@@ -484,7 +611,7 @@ def main():
         print("逐站损失权重 " +
               " ".join(f"{names[i]}:{w_site[i]:.2f}" for i in range(n_site)))
 
-    ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v, cum_hours,
+    ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v,
                          use_spatial, use_future, horizon, lookback,
                          weights=w_train if k == "train" else None)
           for k, v in samples.items()}
@@ -497,18 +624,23 @@ def main():
     use_tok = bool(m.get("use_tok", False))
     tok_dim = int(m.get("tok_dim", 8))
     use_feat = bool(m.get("use_feat", False))
-    model = Net(len(cum_hours) + 4, len(cum_hours), use_spatial, use_site,
+    n_quant = (len(m.get("quantiles", [0.1, 0.5, 0.9]))
+               if str(m.get("loss")) == "quantile" else 1)
+    model = Net(use_spatial, use_site,
                 int(m["hidden"]), int(m["spatial_dim"]), horizon,
                 att_heads=att_heads, att_mode=att_mode, att_excl=att_excl,
                 n_site=n_site if use_tok else 0, tok_dim=tok_dim,
-                use_feat=use_feat, areas=areas if use_feat else None).to(device)
+                use_feat=use_feat, areas=areas if use_feat else None,
+                n_quant=n_quant).to(device)
     print(f"设备 {device}  参数量 {sum(p.numel() for p in model.parameters()) / 1e3:.1f} 千  "
           f"空间分支 {'开' if use_spatial else '关'}  "
           f"预见期降雨 {'有' if use_future else '无'}  "
           f"自注意力 {att_heads or '无'}{'-' + att_mode if att_heads else ''}"
           f"{'-排己' if att_heads and att_excl else ''}  "
           f"站点token {f'{tok_dim}维' if use_tok else '无'}  "
-          f"面积特征 {'开' if use_feat else '关'}")
+          f"面积特征 {'开' if use_feat else '关'}"
+          + (f"  分位数×{n_quant}" if n_quant > 1 else "")
+          + (f"  单步+滚动{rollout}h" if rollout else ""))
 
     out_dir = os.path.join(ROOT, cfg["paths"]["out_dir"])
     os.makedirs(out_dir, exist_ok=True)
@@ -516,22 +648,98 @@ def main():
         model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt"),
                                          map_location=device))
         print(f"已加载 {out_dir}/best.pt，跳过训练")
+    elif int(m.get("unroll", 0)):
+        train_model_unrolled(model, ds["train"], ds["val"], m, out_dir, device)
     else:
         train_model(model, ldr, m, out_dir, device)
     # ---------- 评估 ----------
     model.eval()
-    obs_l, sim_l, site_l = [], [], []
-    with torch.no_grad():
-        for x, hist, frain, idx, y, _w in ldr["test"]:
-            x, hist, frain, idx, y = (t.to(device)
-                                      for t in (x, hist, frain, idx, y))
-            delta = model(x, hist, frain, idx)
-            anchor = hist[:, -1, 0:1]
-            obs_l.append((y + anchor).cpu().numpy())
-            sim_l.append((delta + anchor).cpu().numpy())
-            site_l.append(idx.cpu().numpy())
+
+    if bool(m.get("train_fit", False)) and not args.eval_only:
+        # 背数检查：训练段单步（教师强迫）拟合，物理量 m³/s 逐站 NSE
+        inv_fit = make_inv(transform, q_mean, q_std,
+                           lams if lams is not None else np.zeros(1))
+        fo, fs, fi = [], [], []
+        with torch.no_grad():
+            for x, hist, frain, idx, y, _w in ldr["train"]:
+                x, hist, frain, idx, y = (t.to(device)
+                                          for t in (x, hist, frain, idx, y))
+                dl = model(x, hist, frain, idx)[:, :, model.mid]
+                anchor = hist[:, -1, 0:1]
+                fo.append((y + anchor).cpu().numpy())
+                fs.append((dl + anchor).cpu().numpy())
+                fi.append(idx.cpu().numpy())
+        fo, fs, fi = map(np.concatenate, (fo, fs, fi))
+        print("\n训练段拟合（单步，教师强迫）")
+        ns_fit = []
+        for i in range(n_site):
+            mk = fi == i
+            if mk.sum() == 0:
+                continue
+            o = inv_fit(fo[mk], i).ravel()
+            s = inv_fit(fs[mk], i).ravel()
+            ns_fit.append(nse(o, s))
+            print(f"{ids[i]:11s} {names[i]:10s} NSE {nse(o, s):6.3f}  "
+                  f"MAE {np.mean(np.abs(o - s)):8.3f}")
+        print(f"训练段中位 NSE {np.median(ns_fit):.3f}")
+
+    obs_l, sim_l, site_l, t0_l = [], [], [], []
+    if rollout:
+        # 递归滚动评估：单步模型逐时把预报流量接回历史窗口（末刻锚定与训练一致），
+        # 降雨图输入随滚动时刻前移，推出 R 小时预报；除起报窗外不用实测流量。
+        from collections import defaultdict
+        by_t0 = defaultdict(list)
+        for i, t0 in samples["test"]:
+            by_t0[int(t0)].append(int(i))
+        flow_t = torch.from_numpy(np.nan_to_num(flow_n, nan=0.0)).float().to(device)
+        cs_t, st_t = ds["test"].cs, ds["test"].statics   # make_loader 已挪到 GPU
+        with torch.no_grad():
+            for t0 in sorted(by_t0):
+                idx = torch.tensor(by_t0[t0], device=device)
+                B = len(idx)
+                cur = flow_t[idx, t0:t0 + lookback].clone()   # (B, LB) 滚动历史
+                sims = []
+                for k in range(rollout):
+                    t = t0 + lookback - 1 + k                 # 当前末刻
+                    if use_spatial:
+                        mk_ = st_t[idx][:, 0]                 # (B, G, G) 汇水区掩膜
+                        rnow = cs_t[t] - (cs_t[t - 1] if t > 0 else 0.0)
+                        lo2 = max(0, t - 71)
+                        base = cs_t[lo2 - 1] if lo2 > 0 else 0.0
+                        avg72 = (cs_t[t] - base) / (t - lo2 + 1)
+                        x = torch.stack([rnow * mk_, avg72 * mk_], 1)      # (B,2,G,G)
+                        fut = ((cs_t[t + 1] - cs_t[t]) * mk_).unsqueeze(1)  # 下一小时降雨图
+                        if not use_future:
+                            fut = torch.zeros_like(fut)
+                        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                        fut = torch.nan_to_num(fut, nan=0.0, posinf=0.0,
+                                               neginf=0.0)
+                    else:
+                        x = torch.zeros((B, 1, 1, 1), device=device)
+                        fut = None
+                    hist = cur.unsqueeze(-1)              # (B, LB, 1) 仅流量
+                    nxt = cur[:, -1] + model(x, hist, fut, idx)[:, 0, model.mid]
+                    cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)
+                    sims.append(nxt)
+                sim_l.append(torch.stack(sims, 1).cpu().numpy())
+                ii = idx.cpu().numpy()
+                obs_l.append(flow_n[ii, t0 + lookback:t0 + lookback + R])
+                site_l.append(ii)
+                t0_l.append(np.full(B, t0, dtype=np.int64))
+    else:
+        with torch.no_grad():
+            for x, hist, frain, idx, y, _w in ldr["test"]:
+                x, hist, frain, idx, y = (t.to(device)
+                                          for t in (x, hist, frain, idx, y))
+                delta = model(x, hist, frain, idx)[:, :, model.mid]   # 中位分位点
+                anchor = hist[:, -1, 0:1]
+                obs_l.append((y + anchor).cpu().numpy())
+                sim_l.append((delta + anchor).cpu().numpy())
+                site_l.append(idx.cpu().numpy())
+        t0_l.append(np.array([t0 for _, t0 in samples["test"]], dtype=np.int64))
     obs_n, sim_n = np.concatenate(obs_l), np.concatenate(sim_l)
     st = np.concatenate(site_l)
+    t0_arr = np.concatenate(t0_l)
     inv = make_inv(transform, q_mean, q_std,
                    lams if lams is not None else np.zeros(1))
 
@@ -545,7 +753,7 @@ def main():
             continue
         obs = inv(obs_n[mk], i).ravel()
         sim = inv(sim_n[mk], i).ravel()
-        per = inv(np.repeat(obs_n[mk][:, :1], horizon, axis=1), i).ravel()
+        per = inv(np.repeat(obs_n[mk][:, :1], R, axis=1), i).ravel()
         a, b = nse(obs, sim), nse(obs, per)
         ka, r, al, be = kge(obs, sim)
         kp = kge(obs, per)[0]
@@ -579,9 +787,25 @@ def main():
     if "nse_peak" in summary:
         print(f"大洪水时段 NSE {summary['nse_peak']:.3f}")
 
+    # 分预见期精度：t+1/3/6/12/24 各列单独算逐站 NSE，再取中位。
+    # 滚动预报只有第一步用实测末刻，之后各步输入均为模型自身预报（见上）。
+    leads = [L for L in (1, 3, 6, 12, 24) if L <= R]
+    lead_rows = []
+    for i in range(n_site):
+        mk = st == i
+        if mk.sum() == 0:
+            continue
+        oo, ss = inv(obs_n[mk], i), inv(sim_n[mk], i)
+        lead_rows.append([nse(oo[:, L - 1], ss[:, L - 1]) for L in leads])
+    lr_arr = np.asarray(lead_rows)
+    lead_med = np.median(lr_arr, axis=0)
+    print("\n预见期  " + "  ".join(f"{L:+3d}h" for L in leads))
+    print("中位NSE " + "  ".join(f"{v:5.3f}" for v in lead_med))
+    summary["nse_by_lead"] = {f"{L}h": float(v) for L, v in zip(leads, lead_med)}
+
     np.savez_compressed(
         os.path.join(out_dir, "predictions.npz"),
-        obs=obs_n, sim=sim_n, site=st, t0=np.array([t0 for _, t0 in samples["test"]]),
+        obs=obs_n, sim=sim_n, site=st, t0=t0_arr,
         times=np.array([str(t) for t in times]), q_mean=q_mean, q_std=q_std,
         ids=np.array(ids), names=np.array(names), areas=areas,
         transform=np.array(transform),

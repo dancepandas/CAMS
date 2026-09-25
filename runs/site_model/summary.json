@@ -1,0 +1,10 @@
+{
+  "nse_median": NaN,
+  "nse_persist_median": 0.7791397904928463,
+  "nse_win": 7,
+  "kge_median": NaN,
+  "kge_persist_median": 0.7900405517310121,
+  "kge_win": 3,
+  "n_sites": 15,
+  "nse_peak": NaN
+}

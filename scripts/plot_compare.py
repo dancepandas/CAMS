@@ -30,6 +30,9 @@ MODELS = [  # (行标签, runs 目录, 颜色)
     ("C.4 gstd",    "runs/site_model_gstd",     "#e6ab02"),
     ("C.8 gstd+rattn", "runs/site_model_gstd_rattn", "#1b9e77"),
     ("C.9 gstd+E1", "runs/site_model_gstd_nse", "#d95f02"),
+    ("S.1 单步+滚动", "runs/site_model_step1", "#1f78b4"),
+    ("S.3 展开12+滚动", "runs/site_model_step3", "#e31a1c"),
+    ("S.4 单步+分位", "runs/site_model_step4", "#6a3d9a"),
 ]
 LOOKBACK, HORIZON = 72, 12
 
@@ -40,7 +43,9 @@ def load_run(run_dir):
     tf = str(p["transform"]) if "transform" in p.files else "log1p"
     lams = p["lams"] if "lams" in p.files else np.zeros(1)
     return {
-        "obs": p["obs"], "sim": p["sim"], "site": p["site"], "t0": p["t0"],
+        # 统一到 12h 预见期做图；npz 可能存了更长滚动（如 24h），截断即可
+        "obs": p["obs"][:, :HORIZON], "sim": p["sim"][:, :HORIZON],
+        "site": p["site"], "t0": p["t0"],
         "inv": make_inv(tf, p["q_mean"], p["q_std"], lams),
     }
 
@@ -134,6 +139,8 @@ def main():
     for i in idx:
         ref = runs[0][1]  # 用首个可用 run 的样本取窗口（各 run 样本一致）
         t0s = ref["t0"][ref["site"] == i]
+        # 滚动模型（R=24）与一次性模型（R=12）的测试段网格因 n_win 进位错位约 13h，
+        # 无共同起报时刻；各模型取距窗口最近的有预报样本（≤12h 偏差）
         q_raw = flows[ids[i]]
         wins = pick_windows(q_raw, t0s)
         # 每模型在该站整段测试的 NSE（权威指标，放行标签）
@@ -162,12 +169,26 @@ def main():
                 t_future = times[t0 + LOOKBACK:hi]
                 anchor_q = q_raw[t0 + LOOKBACK - 1]
 
-                mk = np.where((d["site"] == i) & (d["t0"] == t0))[0]
+                cand = d["t0"][d["site"] == i]
+                t0r = int(cand[np.argmin(np.abs(cand - t0))])   # 就近吸附
+                mk = np.where((d["site"] == i) & (d["t0"] == t0r))[0]
+                if len(mk) == 0 or abs(t0r - t0) > 24:
+                    ax.text(0.5, 0.5, "该窗无样本", transform=ax.transAxes,
+                            ha="center", fontsize=9)
+                    continue
                 obs_h = d["inv"](d["obs"][mk[0]], i)
                 sim_h = d["inv"](d["sim"][mk[0]], i)
                 per_h = d["inv"](np.repeat(d["obs"][mk[0], :1], HORIZON), i)
                 # 单窗 12 点近常数时 NSE 分母≈0 会病态爆炸，改用平均绝对误差标注
                 mae = float(np.nanmean(np.abs(obs_h - sim_h)))
+                # 打印画图所用的逐点数据，便于直接核对实测/预报
+                print(f"[画图数据] {ids[i]} {names[i]} {wlab} "
+                      f"起报{t_anchor:%Y-%m-%d %H}时 锚 {anchor_q:.2f}")
+                print("  实测 " + " ".join(f"{v:8.2f}" for v in obs_h))
+                print("  预报 " + " ".join(f"{v:8.2f}" for v in sim_h))
+                print("  偏差 " + " ".join(
+                    f"{(s - o) / o * 100 if o > 1e-9 else float('nan'):7.0f}%"
+                    for o, s in zip(obs_h, sim_h)))
 
                 ax.plot(times[lo:t0 + LOOKBACK], q_hist, color="black", lw=0.9)
                 ax.plot([t_anchor, *t_future], [anchor_q, *obs_h], color="black",
