@@ -79,13 +79,15 @@ class SiteDataset(Dataset):
 
     def __init__(self, cs, statics, flow_n, rain_n, samples,
                  use_spatial, use_future, horizon, lookback, weights=None,
-                 areal=False):
+                 areal=False, mask_ch=False):
         self.cs, self.statics = cs, statics
         self.flow_n, self.rain_n = flow_n, rain_n
         self.samples = np.asarray(samples, dtype=np.int64)  # (n, 2) 便于整批索引
         self.use_spatial, self.use_future = use_spatial, use_future
         # DLinear 模式：不喂降雨图，改喂 3 个面雨量标量（见 __getitem__）
         self.areal = areal
+        # 掩膜池化模式：x 增加第 3 通道 = 汇水区掩膜，供 pool2d 加权归一
+        self.mask_ch = mask_ch
         self.horizon, self.lookback = horizon, lookback
         # 样本级损失权重（如逐站方差归一化）；默认 1 不改变行为
         self.weights = (np.ones(len(self.samples), dtype=np.float32) if weights is None
@@ -102,16 +104,16 @@ class SiteDataset(Dataset):
         delta = tgt - hist[-1]
 
         if self.use_spatial:
-            # 空间支路：汇水区掩膜裁剪后的两张图——最近 1h 降雨、72h 平均雨强；
+            # 空间支路：汇水区掩膜裁剪后的两张图——最近 1h 降雨、72h 累计降雨；
             # 预见期支路：同一张降雨图在预见期内的部分（裁剪）。
             # cs 为降雨图的逐时累积（cs[t]-cs[t-1] 即 t 时刻降雨图），GPU 常驻。
             m = self.statics[i, 0]                          # 汇水区掩膜
             if torch.is_tensor(self.cs):
                 rnow = self.cs[t] - (self.cs[t - 1] if t > 0 else 0.0)
                 lo = max(0, t - 71)
-                base = self.cs[lo - 1] if lo > 0 else 0.0
-                avg72 = (self.cs[t] - base) / (t - lo + 1)
-                x = torch.stack([rnow * m, avg72 * m])
+                rain72 = self.cs[t] - (self.cs[lo - 1] if lo > 0 else 0.0)
+                x = torch.stack([rnow * m, rain72 * m]
+                                + ([m] if self.mask_ch else []))
                 fut = ((self.cs[t + self.horizon] - self.cs[t]) * m
                        if self.use_future else torch.zeros_like(rnow))
                 x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -123,9 +125,9 @@ class SiteDataset(Dataset):
                         self.weights[k])
             rnow = self.cs[t] - (self.cs[t - 1] if t > 0 else 0.0)
             lo = max(0, t - 71)
-            base = self.cs[lo - 1] if lo > 0 else 0.0
-            avg72 = (self.cs[t] - base) / (t - lo + 1)
-            x = np.stack([rnow * m, avg72 * m])
+            rain72 = self.cs[t] - (self.cs[lo - 1] if lo > 0 else 0.0)
+            x = np.stack([rnow * m, rain72 * m]
+                         + ([m] if self.mask_ch else []))
             fut = ((self.cs[t + self.horizon] - self.cs[t]) * m
                    if self.use_future else np.zeros_like(rnow))
             x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -133,12 +135,12 @@ class SiteDataset(Dataset):
         else:
             x = np.zeros((1, 1, 1), dtype=np.float32)
             if self.areal:
-                # DLinear 的线性化降雨输入：当前 1h、72h 均值、下一小时面雨量
+                # DLinear 的线性化降雨输入：当前 1h、72h 累计、下一小时面雨量
                 # （均已全局标准化；下一小时为完美预报近似，与 S 系一致）
                 lo = max(0, t - 71)
                 r_nxt = self.rain_n[i, t + 1] if self.use_future else 0.0
                 fut = np.array([self.rain_n[i, t],
-                                self.rain_n[i, lo:t + 1].mean(), r_nxt],
+                                self.rain_n[i, lo:t + 1].sum(), r_nxt],
                                dtype=np.float32)                       # (3,)
             else:
                 fut = np.zeros((1, 1), dtype=np.float32)
@@ -164,14 +166,30 @@ def make_loader(ds, batch_size, shuffle, device, num_workers=0):
                       num_workers=num_workers, pin_memory=False)
 
 
+def pool2d(f, m=None):
+    """空间池化。 m=None：全局平均池化（旧行为）；m 为掩膜通道时：掩膜加权
+    平均 Σ(f·m)/Σ(m)——每站除以自己的格数，小汇水区不再被 128×128 网格稀释。"""
+    if m is None:
+        return torch.nn.functional.adaptive_avg_pool2d(f, 1).flatten(1)
+    mr = torch.nn.functional.adaptive_avg_pool2d(m, f.shape[-2:])
+    w = mr.sum(dim=(2, 3)).clamp(min=1e-6)                  # (B,1) 本站格数占比
+    return (f * mr).sum(dim=(2, 3)) / w
+
+
+def area_frac(m):
+    """掩膜面积占比 → log 标量，给共享权重的下游提供本站尺度标定。"""
+    return torch.log(m.mean(dim=(1, 2, 3)).clamp(min=1e-6)).unsqueeze(1)
+
+
 class Net(nn.Module):
     def __init__(self, use_spatial, use_site, hidden,
                  spatial_dim, horizon, att_heads=0, att_mode="cat",
                  att_excl=False, n_site=0, tok_dim=8, use_feat=False,
-                 areas=None, n_quant=1):
+                 areas=None, n_quant=1, masked_pool=False):
         super().__init__()
         self.use_spatial, self.use_site = use_spatial, use_site
         self.horizon = horizon
+        self.masked_pool = masked_pool
         # 多分位数输出：forward 返回 (B, horizon, n_quant)，取中位分位点作点预报
         self.n_quant = n_quant
         self.mid = n_quant // 2
@@ -210,6 +228,7 @@ class Net(nn.Module):
             self.att = nn.MultiheadAttention(hidden, att_heads, batch_first=True)
         hist_dim = hidden * (2 if (self.att is not None and att_mode == "cat") else 1)
         fused = (hist_dim + (2 * spatial_dim if use_spatial else 0)
+                 + (1 if use_spatial and masked_pool else 0)
                  + (3 if use_site else 0))
         self.head = nn.Sequential(nn.Linear(fused, 96), nn.ReLU(),
                                   nn.Linear(96, horizon * n_quant))
@@ -248,13 +267,14 @@ class Net(nn.Module):
             feats = [h[-1]]
         if self.use_spatial:
             # 历史态两张图（当前 1h + 72h 平均）与预见期降雨图（下一小时）各自卷积
-            f = self.cnn(x)
-            pooled = torch.nn.functional.adaptive_avg_pool2d(f, 1).flatten(1)
-            feats.append(self.proj(pooled))
+            m = x[:, 2:3] if self.masked_pool else None
+            f = self.cnn(x[:, :2] if self.masked_pool else x)
+            feats.append(self.proj(pool2d(f, m)))
+            if self.masked_pool:
+                feats.append(area_frac(m))
             if frain is not None:
                 ff = self.fut_cnn(frain)
-                fp = torch.nn.functional.adaptive_avg_pool2d(ff, 1).flatten(1)
-                feats.append(self.fproj(fp))
+                feats.append(self.fproj(pool2d(ff, None)))
         if self.use_site and site is not None and site.dim() > 1:
             feats.append(site)
         out = self.head(torch.cat(feats, dim=-1))
@@ -270,14 +290,16 @@ class DLinearNet(nn.Module):
     """
 
     def __init__(self, lookback, n_quant=3, kernel=25, n_rain=3,
-                 use_spatial=False, spatial_dim=48):
+                 use_spatial=False, spatial_dim=48, masked_pool=False):
         super().__init__()
         self.lookback, self.kernel = lookback, kernel
         self.n_quant = n_quant
         self.mid = n_quant // 2
         self.use_spatial = use_spatial
+        self.masked_pool = masked_pool
         self.lin_trend = nn.Linear(lookback, n_quant)
         season_in = lookback + (2 * spatial_dim if use_spatial else n_rain)
+        season_in += 1 if use_spatial and masked_pool else 0   # log 面积占比
         self.lin_season = nn.Linear(season_in, n_quant)
         if use_spatial:
             # 与 Net 同构的空间分支（权重独立重训）
@@ -303,13 +325,13 @@ class DLinearNet(nn.Module):
                                          stride=1).squeeze(1)
         season = q - trend
         if self.use_spatial:
-            f = self.cnn(x)
-            pooled = torch.nn.functional.adaptive_avg_pool2d(f, 1).flatten(1)
-            extras = [self.proj(pooled)]
+            m = x[:, 2:3] if self.masked_pool else None
+            f = self.cnn(x[:, :2] if self.masked_pool else x)
+            extras = [self.proj(pool2d(f, m))]
+            if self.masked_pool:
+                extras.append(area_frac(m))
             if frain is not None:
-                ff = self.fut_cnn(frain)
-                fp = torch.nn.functional.adaptive_avg_pool2d(ff, 1).flatten(1)
-                extras.append(self.fproj(fp))
+                extras.append(self.fproj(pool2d(self.fut_cnn(frain), None)))
             else:
                 extras.append(torch.zeros_like(extras[0]))
             season = torch.cat([season] + extras, -1)
@@ -394,8 +416,10 @@ def unrolled_loss(model, idx, t0, flow_g, cs_g, st_g, w, K, lookback,
             rnow = cs_g[t] - cs_g[t - 1]
             lo = (t - 71).clamp_min(0)
             base = cs_g[(lo - 1).clamp_min(0)] * (lo > 0).float()[:, None, None]
-            avg72 = (cs_g[t] - base) / (t - lo + 1).float()[:, None, None]
-            x = torch.stack([rnow * mk, avg72 * mk], 1)             # (B,2,G,G)
+            rain72 = cs_g[t] - base                                  # 72h 累计
+            x = torch.stack([rnow * mk, rain72 * mk], 1)             # (B,2,G,G)
+            if model.masked_pool:
+                x = torch.cat([x, mk.unsqueeze(1)], 1)               # 掩膜作第3通道
             fut = ((cs_g[t + 1] - cs_g[t]) * mk).unsqueeze(1)       # 下一小时降雨图
             if not use_future:
                 fut = torch.zeros_like(fut)
@@ -684,10 +708,12 @@ def main():
         print("逐站损失权重 " +
               " ".join(f"{names[i]}:{w_site[i]:.2f}" for i in range(n_site)))
 
+    masked_pool = bool(m.get("masked_pool", False))
     ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v,
                          use_spatial, use_future, horizon, lookback,
                          weights=w_train if k == "train" else None,
-                         areal=(str(m.get("arch", "net")) == "dlinear"))
+                         areal=(str(m.get("arch", "net")) == "dlinear"),
+                         mask_ch=masked_pool)
           for k, v in samples.items()}
     ldr = {k: make_loader(v, int(m["batch_size"]), shuffle=(k == "train"),
                           device=device) for k, v in ds.items()}
@@ -702,17 +728,19 @@ def main():
                if str(m.get("loss")) == "quantile" else 1)
     model_arch = str(m.get("arch", "net"))
     if model_arch == "dlinear":
-        model = DLinearNet(lookback, n_quant=n_quant).to(device)
+        model = DLinearNet(lookback, n_quant=n_quant,
+                           masked_pool=masked_pool).to(device)
     elif model_arch == "dlinear_cnn":
         model = DLinearNet(lookback, n_quant=n_quant, use_spatial=True,
-                           spatial_dim=int(m["spatial_dim"])).to(device)
+                           spatial_dim=int(m["spatial_dim"]),
+                           masked_pool=masked_pool).to(device)
     else:
         model = Net(use_spatial, use_site,
                     int(m["hidden"]), int(m["spatial_dim"]), horizon,
                     att_heads=att_heads, att_mode=att_mode, att_excl=att_excl,
                     n_site=n_site if use_tok else 0, tok_dim=tok_dim,
                     use_feat=use_feat, areas=areas if use_feat else None,
-                    n_quant=n_quant).to(device)
+                    n_quant=n_quant, masked_pool=masked_pool).to(device)
     print(f"设备 {device}  参数量 {sum(p.numel() for p in model.parameters()) / 1e3:.1f} 千  "
           f"结构 {model_arch}  "
           f"空间分支 {'开' if use_spatial else '关'}  "
@@ -721,6 +749,7 @@ def main():
           f"{'-排己' if att_heads and att_excl else ''}  "
           f"站点token {f'{tok_dim}维' if use_tok else '无'}  "
           f"面积特征 {'开' if use_feat else '关'}"
+          + (f"  掩膜池化 开" if masked_pool else "")
           + (f"  分位数×{n_quant}" if n_quant > 1 else "")
           + (f"  单步+滚动{rollout}h" if rollout else ""))
 
@@ -789,8 +818,10 @@ def main():
                         rnow = cs_t[t] - (cs_t[t - 1] if t > 0 else 0.0)
                         lo2 = max(0, t - 71)
                         base = cs_t[lo2 - 1] if lo2 > 0 else 0.0
-                        avg72 = (cs_t[t] - base) / (t - lo2 + 1)
-                        x = torch.stack([rnow * mk_, avg72 * mk_], 1)      # (B,2,G,G)
+                        rain72 = cs_t[t] - base                      # 72h 累计
+                        x = torch.stack([rnow * mk_, rain72 * mk_], 1)      # (B,2,G,G)
+                        if masked_pool:
+                            x = torch.cat([x, mk_.unsqueeze(1)], 1)   # 掩膜作第3通道
                         fut = ((cs_t[t + 1] - cs_t[t]) * mk_).unsqueeze(1)  # 下一小时降雨图
                         if not use_future:
                             fut = torch.zeros_like(fut)
