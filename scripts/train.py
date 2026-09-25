@@ -185,11 +185,15 @@ class Net(nn.Module):
     def __init__(self, use_spatial, use_site, hidden,
                  spatial_dim, horizon, att_heads=0, att_mode="cat",
                  att_excl=False, n_site=0, tok_dim=8, use_feat=False,
-                 areas=None, n_quant=1, masked_pool=False):
+                 areas=None, n_quant=1, masked_pool=False, delta_cap=0.0):
         super().__init__()
         self.use_spatial, self.use_site = use_spatial, use_site
         self.horizon = horizon
         self.masked_pool = masked_pool
+        # 单步增量硬上限（标准化空间，tanh 饱和）：训练段最大小时跳变约 5.9σ，
+        # 取 6 作顶——分布内不受限（tanh 在原点附近恒等），分布外反馈放大被刹车。
+        # 0 = 关闭。对称 S.5/S.6/S.7 线性主干的天然有界性（Helene 不穿顶）。
+        self.delta_cap = float(delta_cap)
         # 多分位数输出：forward 返回 (B, horizon, n_quant)，取中位分位点作点预报
         self.n_quant = n_quant
         self.mid = n_quant // 2
@@ -278,7 +282,10 @@ class Net(nn.Module):
         if self.use_site and site is not None and site.dim() > 1:
             feats.append(site)
         out = self.head(torch.cat(feats, dim=-1))
-        return out.view(B, self.horizon, self.n_quant)
+        out = out.view(B, self.horizon, self.n_quant)
+        if self.delta_cap > 0:
+            out = self.delta_cap * torch.tanh(out / self.delta_cap)
+        return out
 
 
 class DLinearNet(nn.Module):
@@ -290,13 +297,15 @@ class DLinearNet(nn.Module):
     """
 
     def __init__(self, lookback, n_quant=3, kernel=25, n_rain=3,
-                 use_spatial=False, spatial_dim=48, masked_pool=False):
+                 use_spatial=False, spatial_dim=48, masked_pool=False,
+                 delta_cap=0.0):
         super().__init__()
         self.lookback, self.kernel = lookback, kernel
         self.n_quant = n_quant
         self.mid = n_quant // 2
         self.use_spatial = use_spatial
         self.masked_pool = masked_pool
+        self.delta_cap = float(delta_cap)
         self.lin_trend = nn.Linear(lookback, n_quant)
         season_in = lookback + (2 * spatial_dim if use_spatial else n_rain)
         season_in += 1 if use_spatial and masked_pool else 0   # log 面积占比
@@ -340,7 +349,10 @@ class DLinearNet(nn.Module):
                 frain = torch.zeros(q.shape[0], 3, device=q.device)
             season = torch.cat([season, frain.reshape(q.shape[0], -1)], -1)
         out = self.lin_trend(trend) + self.lin_season(season)
-        return out.unsqueeze(1)                             # (B, 1, K)
+        out = out.unsqueeze(1)                             # (B, 1, K)
+        if self.delta_cap > 0:
+            out = self.delta_cap * torch.tanh(out / self.delta_cap)
+        return out
 
 
 def nse(obs, sim):
@@ -709,6 +721,7 @@ def main():
               " ".join(f"{names[i]}:{w_site[i]:.2f}" for i in range(n_site)))
 
     masked_pool = bool(m.get("masked_pool", False))
+    delta_cap = float(m.get("delta_cap", 0.0))
     ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v,
                          use_spatial, use_future, horizon, lookback,
                          weights=w_train if k == "train" else None,
@@ -729,18 +742,19 @@ def main():
     model_arch = str(m.get("arch", "net"))
     if model_arch == "dlinear":
         model = DLinearNet(lookback, n_quant=n_quant,
-                           masked_pool=masked_pool).to(device)
+                           masked_pool=masked_pool, delta_cap=delta_cap).to(device)
     elif model_arch == "dlinear_cnn":
         model = DLinearNet(lookback, n_quant=n_quant, use_spatial=True,
                            spatial_dim=int(m["spatial_dim"]),
-                           masked_pool=masked_pool).to(device)
+                           masked_pool=masked_pool, delta_cap=delta_cap).to(device)
     else:
         model = Net(use_spatial, use_site,
                     int(m["hidden"]), int(m["spatial_dim"]), horizon,
                     att_heads=att_heads, att_mode=att_mode, att_excl=att_excl,
                     n_site=n_site if use_tok else 0, tok_dim=tok_dim,
                     use_feat=use_feat, areas=areas if use_feat else None,
-                    n_quant=n_quant, masked_pool=masked_pool).to(device)
+                    n_quant=n_quant, masked_pool=masked_pool,
+                    delta_cap=delta_cap).to(device)
     print(f"设备 {device}  参数量 {sum(p.numel() for p in model.parameters()) / 1e3:.1f} 千  "
           f"结构 {model_arch}  "
           f"空间分支 {'开' if use_spatial else '关'}  "
@@ -750,6 +764,7 @@ def main():
           f"站点token {f'{tok_dim}维' if use_tok else '无'}  "
           f"面积特征 {'开' if use_feat else '关'}"
           + (f"  掩膜池化 开" if masked_pool else "")
+          + (f"  增量限幅{delta_cap:g}σ" if delta_cap > 0 else "")
           + (f"  分位数×{n_quant}" if n_quant > 1 else "")
           + (f"  单步+滚动{rollout}h" if rollout else ""))
 

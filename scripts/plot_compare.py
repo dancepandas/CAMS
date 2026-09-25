@@ -36,6 +36,8 @@ MODELS = [  # (行标签, runs 目录, 颜色)
     ("DLinear 线性", "runs/site_model_dlinear", "#984ea3"),
     ("S.6 线性+CNN", "runs/site_model_dlinear_cnn", "#ff7f00"),
     ("S.7 掩膜池化", "runs/site_model_dlmcnn_mp", "#a65628"),
+    ("S.8 LSTM+掩膜池", "runs/site_model_step8_mp", "#66c2a5"),
+    ("S.9 +增量限幅", "runs/site_model_step9_cap", "#fc8d62"),
 ]
 LOOKBACK, HORIZON = 72, 12
 
