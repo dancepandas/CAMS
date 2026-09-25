@@ -355,6 +355,44 @@ class DLinearNet(nn.Module):
         return out
 
 
+class MoENet(nn.Module):
+    """双专家软门控（MoE）：两个完全独立的 Net 各出一套分位数增量预测，
+    门控按 [当前流量z, 近24h均值z, log面积占比] 给两项输出加权融合。
+    动机：大小站量程差 273 倍，训练时梯度互相干扰（C.9 损失加权的结构版对偶），
+    让模型自由分工，不加任何强迫——跑完看门控实际怎么分（main 里有分工报告）。
+    """
+
+    def __init__(self, use_spatial, use_site, hidden, spatial_dim, horizon,
+                 n_quant=3, masked_pool=False, delta_cap=0.0, areas=None):
+        super().__init__()
+        self.horizon, self.n_quant = horizon, n_quant
+        self.mid = n_quant // 2
+        self.experts = nn.ModuleList([
+            Net(use_spatial, use_site, hidden, spatial_dim, horizon,
+                n_quant=n_quant, masked_pool=masked_pool, delta_cap=delta_cap),
+            Net(use_spatial, use_site, hidden, spatial_dim, horizon,
+                n_quant=n_quant, masked_pool=masked_pool, delta_cap=delta_cap)])
+        med = float(np.median(areas))
+        self.register_buffer(
+            "lg_area", torch.log(torch.as_tensor(areas, dtype=torch.float32) / med))
+        # 门控只看 3 个可解释标量：现在多大水、近期多大水、站多大
+        self.gate = nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 2))
+
+    def gate_w(self, hist, site):
+        """两项门控权重 (B, 2)，softmax 和为 1。单独成方法便于评估时复查分工。"""
+        z = hist[:, -1, 0]
+        z24 = hist[:, -24:, 0].mean(dim=1)
+        g = torch.softmax(self.gate(torch.stack(
+            [z, z24, self.lg_area[site]], 1)), dim=1)
+        return g
+
+    def forward(self, x, hist, frain, site):
+        g = self.gate_w(hist, site)
+        o1 = self.experts[0](x, hist, frain, site)
+        o2 = self.experts[1](x, hist, frain, site)
+        return g[:, 0, None, None] * o1 + g[:, 1, None, None] * o2
+
+
 def nse(obs, sim):
     return float(1 - ((obs - sim) ** 2).sum()
                  / max(((obs - obs.mean()) ** 2).sum(), 1e-9))
@@ -747,6 +785,11 @@ def main():
         model = DLinearNet(lookback, n_quant=n_quant, use_spatial=True,
                            spatial_dim=int(m["spatial_dim"]),
                            masked_pool=masked_pool, delta_cap=delta_cap).to(device)
+    elif model_arch == "moe":
+        model = MoENet(use_spatial, use_site, int(m["hidden"]),
+                       int(m["spatial_dim"]), horizon, n_quant=n_quant,
+                       masked_pool=masked_pool, delta_cap=delta_cap,
+                       areas=areas).to(device)
     else:
         model = Net(use_spatial, use_site,
                     int(m["hidden"]), int(m["spatial_dim"]), horizon,
@@ -941,6 +984,36 @@ def main():
     print("\n预见期  " + "  ".join(f"{L:+3d}h" for L in leads))
     print("中位NSE " + "  ".join(f"{v:5.3f}" for v in lead_med))
     summary["nse_by_lead"] = {f"{L}h": float(v) for L, v in zip(leads, lead_med)}
+
+    if model_arch == "moe":
+        # 分工报告：门控第二项（专家2）权重——按站、按流量档统计，
+        # 回答"模型是否按预期把大小站/大小流分开"（软门控，权重和为 1）。
+        gw, gs, gz = [], [], []
+        with torch.no_grad():
+            for x, hist, frain, idx, y, _w in ldr["test"]:
+                x, hist, frain, idx = (t.to(device)
+                                       for t in (x, hist, frain, idx))
+                gw.append(model.gate_w(hist, idx)[:, 1].cpu().numpy())
+                gs.append(idx.cpu().numpy())
+                gz.append(hist[:, -1, 0].cpu().numpy())
+        gw = np.concatenate(gw)
+        gs = np.concatenate(gs)
+        gz = np.concatenate(gz)
+        print("\n门控分工报告（数值=专家2的平均权重，越大越靠专家2；按面积排序）")
+        order = np.argsort(areas)
+        for i in order:
+            mk = gs == i
+            if mk.sum():
+                print(f"{ids[i]:11s} {names[i]:10s} {areas[i]:6.0f} km²  "
+                      f"专家2权重 {gw[mk].mean():.3f}")
+        qs = np.quantile(gz, [0.5, 0.9, 0.99])
+        print("按当前流量分档（全站合并）：")
+        print(f"  小水 z<{qs[0]:6.2f}      专家2权重 {gw[gz < qs[0]].mean():.3f}")
+        for lo_, hi_, lab in [(qs[0], qs[1], "中水"), (qs[1], qs[2], "大水"),
+                              (qs[2], np.inf, "特大")]:
+            mk = (gz >= lo_) & (gz < hi_)
+            if mk.sum():
+                print(f"  {lab} z∈[{lo_:5.2f},{hi_:5.2f})  专家2权重 {gw[mk].mean():.3f}")
 
     np.savez_compressed(
         os.path.join(out_dir, "predictions.npz"),

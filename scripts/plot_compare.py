@@ -38,6 +38,7 @@ MODELS = [  # (行标签, runs 目录, 颜色)
     ("S.7 掩膜池化", "runs/site_model_dlmcnn_mp", "#a65628"),
     ("S.8 LSTM+掩膜池", "runs/site_model_step8_mp", "#66c2a5"),
     ("S.9 +增量限幅", "runs/site_model_step9_cap", "#fc8d62"),
+    ("S.10 MoE双专家", "runs/site_model_moe", "#8dd3c7"),
 ]
 LOOKBACK, HORIZON = 72, 12
 
