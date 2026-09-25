@@ -263,18 +263,36 @@ class Net(nn.Module):
 
 class DLinearNet(nn.Module):
     """DLinear（Zeng et al., AAAI'23）共享权重移植：移动平均分解趋势/季节，
-    两支各一个线性层相加。输入与 S.4 对齐：72h 流量（gstd 全局标准化）
-    分解后，季节支额外拼 3 个面雨量标量（当前 1h、72h 均值、下一小时，
-    均已标准化）。降雨图的空间结构是线性模型吃不了的，本结构刻意不收。
+    两支各一个线性层相加。arch="dlinear" 时仅收流量历史 + 3 个面雨量标量
+    （当前 1h、72h 均值、下一小时，均已标准化）；arch="dlinear_cnn" 时
+    改收 S.4 的空间分支（2 通道降雨图 CNN + 下一小时降雨图 CNN，池化后
+    拼进季节支）——把 S.4 的价值拆成"空间编码"与"时序主干"两部分对照。
     """
 
-    def __init__(self, lookback, n_quant=3, kernel=25, n_rain=3):
+    def __init__(self, lookback, n_quant=3, kernel=25, n_rain=3,
+                 use_spatial=False, spatial_dim=48):
         super().__init__()
         self.lookback, self.kernel = lookback, kernel
         self.n_quant = n_quant
         self.mid = n_quant // 2
+        self.use_spatial = use_spatial
         self.lin_trend = nn.Linear(lookback, n_quant)
-        self.lin_season = nn.Linear(lookback + n_rain, n_quant)
+        season_in = lookback + (2 * spatial_dim if use_spatial else n_rain)
+        self.lin_season = nn.Linear(season_in, n_quant)
+        if use_spatial:
+            # 与 Net 同构的空间分支（权重独立重训）
+            self.cnn = nn.Sequential(
+                nn.Conv2d(2, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 24, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(24, 32, 3, stride=2, padding=1), nn.ReLU(),
+            )
+            self.proj = nn.Linear(32, spatial_dim)
+            self.fut_cnn = nn.Sequential(
+                nn.Conv2d(1, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 24, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(24, 32, 3, stride=2, padding=1), nn.ReLU(),
+            )
+            self.fproj = nn.Linear(32, spatial_dim)
 
     def forward(self, x, hist, frain, site):
         q = hist[:, :, 0]                                   # (B, LB) 标准化流量
@@ -284,10 +302,22 @@ class DLinearNet(nn.Module):
         trend = nn.functional.avg_pool1d(qp.unsqueeze(1), self.kernel,
                                          stride=1).squeeze(1)
         season = q - trend
-        if frain is None:
-            frain = torch.zeros(q.shape[0], 3, device=q.device)
-        r = frain.reshape(q.shape[0], -1)                   # (B, 3) 面雨量标量
-        out = self.lin_trend(trend) + self.lin_season(torch.cat([season, r], -1))
+        if self.use_spatial:
+            f = self.cnn(x)
+            pooled = torch.nn.functional.adaptive_avg_pool2d(f, 1).flatten(1)
+            extras = [self.proj(pooled)]
+            if frain is not None:
+                ff = self.fut_cnn(frain)
+                fp = torch.nn.functional.adaptive_avg_pool2d(ff, 1).flatten(1)
+                extras.append(self.fproj(fp))
+            else:
+                extras.append(torch.zeros_like(extras[0]))
+            season = torch.cat([season] + extras, -1)
+        else:
+            if frain is None:
+                frain = torch.zeros(q.shape[0], 3, device=q.device)
+            season = torch.cat([season, frain.reshape(q.shape[0], -1)], -1)
+        out = self.lin_trend(trend) + self.lin_season(season)
         return out.unsqueeze(1)                             # (B, 1, K)
 
 
@@ -673,6 +703,9 @@ def main():
     model_arch = str(m.get("arch", "net"))
     if model_arch == "dlinear":
         model = DLinearNet(lookback, n_quant=n_quant).to(device)
+    elif model_arch == "dlinear_cnn":
+        model = DLinearNet(lookback, n_quant=n_quant, use_spatial=True,
+                           spatial_dim=int(m["spatial_dim"])).to(device)
     else:
         model = Net(use_spatial, use_site,
                     int(m["hidden"]), int(m["spatial_dim"]), horizon,
