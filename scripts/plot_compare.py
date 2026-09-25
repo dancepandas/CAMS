@@ -33,6 +33,7 @@ MODELS = [  # (行标签, runs 目录, 颜色)
     ("S.1 单步+滚动", "runs/site_model_step1", "#1f78b4"),
     ("S.3 展开12+滚动", "runs/site_model_step3", "#e31a1c"),
     ("S.4 单步+分位", "runs/site_model_step4", "#6a3d9a"),
+    ("DLinear 线性", "runs/site_model_dlinear", "#984ea3"),
 ]
 LOOKBACK, HORIZON = 72, 12
 

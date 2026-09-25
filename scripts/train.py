@@ -78,11 +78,14 @@ class SiteDataset(Dataset):
     """按需组装空间输入，避免把全部样本预先展开成巨大数组。"""
 
     def __init__(self, cs, statics, flow_n, rain_n, samples,
-                 use_spatial, use_future, horizon, lookback, weights=None):
+                 use_spatial, use_future, horizon, lookback, weights=None,
+                 areal=False):
         self.cs, self.statics = cs, statics
         self.flow_n, self.rain_n = flow_n, rain_n
         self.samples = np.asarray(samples, dtype=np.int64)  # (n, 2) 便于整批索引
         self.use_spatial, self.use_future = use_spatial, use_future
+        # DLinear 模式：不喂降雨图，改喂 3 个面雨量标量（见 __getitem__）
+        self.areal = areal
         self.horizon, self.lookback = horizon, lookback
         # 样本级损失权重（如逐站方差归一化）；默认 1 不改变行为
         self.weights = (np.ones(len(self.samples), dtype=np.float32) if weights is None
@@ -129,7 +132,16 @@ class SiteDataset(Dataset):
             fut = np.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             x = np.zeros((1, 1, 1), dtype=np.float32)
-            fut = np.zeros((1, 1), dtype=np.float32)
+            if self.areal:
+                # DLinear 的线性化降雨输入：当前 1h、72h 均值、下一小时面雨量
+                # （均已全局标准化；下一小时为完美预报近似，与 S 系一致）
+                lo = max(0, t - 71)
+                r_nxt = self.rain_n[i, t + 1] if self.use_future else 0.0
+                fut = np.array([self.rain_n[i, t],
+                                self.rain_n[i, lo:t + 1].mean(), r_nxt],
+                               dtype=np.float32)                       # (3,)
+            else:
+                fut = np.zeros((1, 1), dtype=np.float32)
         return (torch.tensor(x, dtype=torch.float32),
                 torch.tensor(hist[:, None], dtype=torch.float32),
                 torch.tensor(fut, dtype=torch.float32),
@@ -144,7 +156,8 @@ def make_loader(ds, batch_size, shuffle, device, num_workers=0):
     放到 GPU 上既省内存又能让 __getitem__ 只回传小切片。
     """
     if device.type == "cuda":
-        ds.cs = torch.from_numpy(ds.cs).to(device)          # 常驻 GPU
+        if ds.cs is not None:
+            ds.cs = torch.from_numpy(ds.cs).to(device)      # 常驻 GPU
         ds.statics = torch.from_numpy(ds.statics).to(device)
     # 空间输入已常驻 GPU，其余小切片就地创建，无需 pin_memory
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
@@ -246,6 +259,36 @@ class Net(nn.Module):
             feats.append(site)
         out = self.head(torch.cat(feats, dim=-1))
         return out.view(B, self.horizon, self.n_quant)
+
+
+class DLinearNet(nn.Module):
+    """DLinear（Zeng et al., AAAI'23）共享权重移植：移动平均分解趋势/季节，
+    两支各一个线性层相加。输入与 S.4 对齐：72h 流量（gstd 全局标准化）
+    分解后，季节支额外拼 3 个面雨量标量（当前 1h、72h 均值、下一小时，
+    均已标准化）。降雨图的空间结构是线性模型吃不了的，本结构刻意不收。
+    """
+
+    def __init__(self, lookback, n_quant=3, kernel=25, n_rain=3):
+        super().__init__()
+        self.lookback, self.kernel = lookback, kernel
+        self.n_quant = n_quant
+        self.mid = n_quant // 2
+        self.lin_trend = nn.Linear(lookback, n_quant)
+        self.lin_season = nn.Linear(lookback + n_rain, n_quant)
+
+    def forward(self, x, hist, frain, site):
+        q = hist[:, :, 0]                                   # (B, LB) 标准化流量
+        pad = self.kernel // 2
+        qp = torch.cat([q[:, :1].expand(-1, pad), q,
+                        q[:, -1:].expand(-1, pad)], dim=1)  # 端点延拓
+        trend = nn.functional.avg_pool1d(qp.unsqueeze(1), self.kernel,
+                                         stride=1).squeeze(1)
+        season = q - trend
+        if frain is None:
+            frain = torch.zeros(q.shape[0], 3, device=q.device)
+        r = frain.reshape(q.shape[0], -1)                   # (B, 3) 面雨量标量
+        out = self.lin_trend(trend) + self.lin_season(torch.cat([season, r], -1))
+        return out.unsqueeze(1)                             # (B, 1, K)
 
 
 def nse(obs, sim):
@@ -613,7 +656,8 @@ def main():
 
     ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v,
                          use_spatial, use_future, horizon, lookback,
-                         weights=w_train if k == "train" else None)
+                         weights=w_train if k == "train" else None,
+                         areal=(str(m.get("arch", "net")) == "dlinear"))
           for k, v in samples.items()}
     ldr = {k: make_loader(v, int(m["batch_size"]), shuffle=(k == "train"),
                           device=device) for k, v in ds.items()}
@@ -626,13 +670,18 @@ def main():
     use_feat = bool(m.get("use_feat", False))
     n_quant = (len(m.get("quantiles", [0.1, 0.5, 0.9]))
                if str(m.get("loss")) == "quantile" else 1)
-    model = Net(use_spatial, use_site,
-                int(m["hidden"]), int(m["spatial_dim"]), horizon,
-                att_heads=att_heads, att_mode=att_mode, att_excl=att_excl,
-                n_site=n_site if use_tok else 0, tok_dim=tok_dim,
-                use_feat=use_feat, areas=areas if use_feat else None,
-                n_quant=n_quant).to(device)
+    model_arch = str(m.get("arch", "net"))
+    if model_arch == "dlinear":
+        model = DLinearNet(lookback, n_quant=n_quant).to(device)
+    else:
+        model = Net(use_spatial, use_site,
+                    int(m["hidden"]), int(m["spatial_dim"]), horizon,
+                    att_heads=att_heads, att_mode=att_mode, att_excl=att_excl,
+                    n_site=n_site if use_tok else 0, tok_dim=tok_dim,
+                    use_feat=use_feat, areas=areas if use_feat else None,
+                    n_quant=n_quant).to(device)
     print(f"设备 {device}  参数量 {sum(p.numel() for p in model.parameters()) / 1e3:.1f} 千  "
+          f"结构 {model_arch}  "
           f"空间分支 {'开' if use_spatial else '关'}  "
           f"预见期降雨 {'有' if use_future else '无'}  "
           f"自注意力 {att_heads or '无'}{'-' + att_mode if att_heads else ''}"
@@ -692,6 +741,7 @@ def main():
         for i, t0 in samples["test"]:
             by_t0[int(t0)].append(int(i))
         flow_t = torch.from_numpy(np.nan_to_num(flow_n, nan=0.0)).float().to(device)
+        rain_t = torch.from_numpy(np.nan_to_num(rain_n, nan=0.0)).float().to(device)
         cs_t, st_t = ds["test"].cs, ds["test"].statics   # make_loader 已挪到 GPU
         with torch.no_grad():
             for t0 in sorted(by_t0):
@@ -717,6 +767,16 @@ def main():
                     else:
                         x = torch.zeros((B, 1, 1, 1), device=device)
                         fut = None
+                        if model_arch == "dlinear":
+                            # 滚动时刻 t 的 3 个面雨量标量，与训练集 __getitem__ 同式
+                            lo2 = max(0, t - 71)
+                            fut = torch.stack([rain_t[idx, t],
+                                               rain_t[idx, lo2:t + 1].mean(dim=1),
+                                               rain_t[idx, t + 1]], 1)
+                            if not use_future:
+                                fut = torch.cat(
+                                    [fut[:, :2],
+                                     torch.zeros(B, 1, device=device)], 1)
                     hist = cur.unsqueeze(-1)              # (B, LB, 1) 仅流量
                     nxt = cur[:, -1] + model(x, hist, fut, idx)[:, 0, model.mid]
                     cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)
