@@ -43,25 +43,35 @@ LEAD_COL = {1: "#a50026", 3: "#f46d43", 6: "#fdae61", 12: "#74add1", 24: "#4575b
 
 
 def load_run(run_dir):
-    p = np.load(os.path.join(ROOT, run_dir, "predictions.npz"), allow_pickle=True)
+    # 优先用逐小时密集推理产物（真连续曲线）；否则退回 24h 网格的存档预报
+    for fn in ("predictions_dense.npz", "predictions.npz"):
+        pth = os.path.join(ROOT, run_dir, fn)
+        if os.path.isfile(pth):
+            p = np.load(pth, allow_pickle=True)
+            break
+    else:
+        raise FileNotFoundError(run_dir)
     from train import make_inv
     tf = str(p["transform"]) if "transform" in p.files else "log1p"
     lams = p["lams"] if "lams" in p.files else np.zeros(1)
     return {"obs": p["obs"], "sim": p["sim"], "site": p["site"], "t0": p["t0"],
-            "inv": make_inv(tf, p["q_mean"], p["q_std"], lams)}
+            "inv": make_inv(tf, p["q_mean"], p["q_std"], lams),
+            "dense": "dense" in os.path.basename(pth)}
 
 
 def lead_series(d, i, lead, q_raw, times):
     """提前 lead 小时的连续预报序列：目标时刻 j 的预报 = 起报 t0=j-72-lead+1 样本的第 lead-1 步。
 
     返回 (目标时刻索引数组, 预报值数组, 持续性数组, 该窗实测数组)。
+    持续性基准 = 锚点流量（最后观测时刻 t0+71 的实测），不用 obs[:,0]
+    （那是 t0+72 的值，等于偷看 1 小时未来，起报时不可能知道）。
     """
     k = lead - 1  # 0-based 步
     mk = d["site"] == i
     t0 = d["t0"][mk]
     tgt = t0 + LOOKBACK + k
     sim = d["inv"](d["sim"][mk][:, k], i)
-    pers = d["inv"](d["obs"][mk][:, 0], i)  # 锚点流量 = 持续性预报
+    pers = q_raw[t0 + LOOKBACK - 1]  # 锚点流量 = 持续性预报
     return tgt, sim, pers
 
 
@@ -141,10 +151,13 @@ def main():
             sel = (t0s + LOOKBACK >= lo - 24) & (t0s + LOOKBACK < hi)
             for a, row in zip(t0s[sel], d["sim"][mk][sel]):
                 tt_a = times[a + LOOKBACK: a + LOOKBACK + len(row)]
-                ax.plot(tt_a, d["inv"](row, i), color=col, lw=0.7, alpha=0.30)
+                v_a = d["inv"](row, i)
+                clip = (tt_a >= times[lo]) & (tt_a <= times[hi - 1])  # 裁到窗内，防拉宽x轴
+                ax.plot(tt_a[clip], v_a[clip], color=col, lw=0.7, alpha=0.30)
             nse24 = np.nan
             n_lt = 0
-            for lead in LEADS:
+            leads = [L for L in LEADS if L <= d["sim"].shape[1]]
+            for lead in leads:
                 tgt, sim, pers = lead_series(d, i, lead, q_raw, times)
                 m = (tgt >= lo) & (tgt < hi)
                 if not m.any():
@@ -152,15 +165,15 @@ def main():
                 tj, sj = times[tgt[m]], sim[m]
                 ax.plot(tj, sj, color=LEAD_COL[lead], lw=1.6, marker="o", ms=2.5,
                         label=f"提前{lead}h")
-                if lead == max(LEADS):
+                if lead == max(leads):
                     nse24 = win_nse(q_raw[tgt[m]], sj)
                     n_lt = int(np.isfinite(q_raw[tgt[m]]).sum())
                     n_lt_max = max(n_lt_max, n_lt)
                     ax.plot(tj, pers[m], color="#999999", lw=1.0, ls="--",
                             label=f"持续性({lead}h)")
             ax.axvline(times[pk], color="#bbbbbb", lw=0.8, ls=":")
-            lab_nse = (f"24h窗NSE {nse24:.2f}" if np.isfinite(nse24)
-                       else f"24h预报点{n_lt}个")
+            lab_nse = (f"提前{max(leads)}h窗NSE {nse24:.2f}" if np.isfinite(nse24)
+                       else f"提前{max(leads)}h预报点{n_lt}个")
             ax.set_ylabel(f"{lab}\n{lab_nse}", fontsize=9)
             ax.grid(alpha=0.25)
             axr = ax.twinx()
@@ -170,18 +183,27 @@ def main():
             axr.set_yticks([])
             if r == 0:
                 ax.legend(loc="upper right", fontsize=7, ncol=6)
-                ax.set_title(f"事件峰 {times[pk]:%Y-%m-%d %H时}  "
-                             f"实测峰 {q_raw[pk]:.0f} m³/s", fontsize=10)
+                if len(runs) > 1:
+                    ax.set_title(f"事件峰 {times[pk]:%Y-%m-%d %H时}  "
+                                 f"实测峰 {q_raw[pk]:.0f} m³/s", fontsize=10)
 
         axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         fig.text(0.995, 0.5, "绿=面雨量 mm/h", rotation=90, va="center",
                  fontsize=8, color="#4dac26")
+        # 窗内 24h 预报点理论上限（按起报网格密度折算）
+        t0r = runs[0][1]["t0"][runs[0][1]["site"] == i]
+        stride = int(np.median(np.diff(np.sort(t0r)))) if len(t0r) > 1 else 24
+        n_exp = max(1, (hi - lo) // stride)
         warn = ""
-        if n_lt_max < 14:
-            warn = f"  ⚠ 事件窗内仅 {n_lt_max}/20 个预报点（本站记录缺测多，稀疏段无预报）"
+        if n_lt_max < n_exp * 0.7:
+            warn = (f"  ⚠ 事件窗内仅 {n_lt_max}/{n_exp} 个24h预报点"
+                    f"（本站记录缺测多，稀疏段无预报）")
+        who = (f"最佳模型 {runs[0][0]}" if len(runs) == 1
+               else f"{len(runs)} 模型")
+        if len(runs) == 1:
+            who += f"  事件峰 {times[pk]:%Y-%m-%d %H时}  实测峰 {q_raw[pk]:.0f} m³/s"
         fig.suptitle(f"{ids[i]} {names[i]}  {areas[i]:.0f} km²  "
-                     f"洪水事件全过程（涨水-峰-退水）× {len(runs)} 模型{warn}",
-                     fontsize=12)
+                     f"洪水事件全过程（涨水-峰-退水）× {who}{warn}", fontsize=12)
         out = os.path.join(out_dir, f"{ids[i]}_{names[i]}.png")
         fig.savefig(out, dpi=110)
         plt.close(fig)

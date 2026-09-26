@@ -146,8 +146,8 @@ def main():
     for i in idx:
         ref = runs[0][1]  # 用首个可用 run 的样本取窗口（各 run 样本一致）
         t0s = ref["t0"][ref["site"] == i]
-        # 滚动模型（R=24）与一次性模型（R=12）的测试段网格因 n_win 进位错位约 13h，
-        # 无共同起报时刻；各模型取距窗口最近的有预报样本（≤12h 偏差）
+        # 各模型 t0 网格不同；就近吸附容差 6h，超出的窗不画（曾用 24h 致 S 系曲线
+        # 被平移最多 23h 画在错误时间上）；错位在面板内标注
         q_raw = flows[ids[i]]
         wins = pick_windows(q_raw, t0s)
         # 每模型在该站整段测试的 NSE（权威指标，放行标签）
@@ -178,14 +178,16 @@ def main():
 
                 cand = d["t0"][d["site"] == i]
                 t0r = int(cand[np.argmin(np.abs(cand - t0))])   # 就近吸附
+                off = t0r - t0
                 mk = np.where((d["site"] == i) & (d["t0"] == t0r))[0]
-                if len(mk) == 0 or abs(t0r - t0) > 24:
+                if len(mk) == 0 or abs(off) > 6:
                     ax.text(0.5, 0.5, "该窗无样本", transform=ax.transAxes,
                             ha="center", fontsize=9)
                     continue
                 obs_h = d["inv"](d["obs"][mk[0]], i)
                 sim_h = d["inv"](d["sim"][mk[0]], i)
-                per_h = d["inv"](np.repeat(d["obs"][mk[0], :1], HORIZON), i)
+                # 持续性 = 锚点流量平推（锚点=最后观测时刻 t0+71），不用 obs[:,0]（那是 t0+72，偷看1h）
+                per_h = np.full(HORIZON, anchor_q)
                 # 单窗 12 点近常数时 NSE 分母≈0 会病态爆炸，改用平均绝对误差标注
                 mae = float(np.nanmean(np.abs(obs_h - sim_h)))
                 # 打印画图所用的逐点数据，便于直接核对实测/预报
@@ -205,7 +207,10 @@ def main():
                 ax.plot([t_anchor, *t_future], [anchor_q, *per_h], color="#999999",
                         lw=0.9, ls="--", label="持续性")
                 ax.axvline(t_anchor, color="#bbbbbb", lw=0.6)
-                ax.text(0.02, 0.04, f"MAE {mae:.2f} m³/s",
+                note = f"MAE {mae:.2f} m³/s"
+                if off != 0:
+                    note += f"  ⚠起报错位{off:+d}h"
+                ax.text(0.02, 0.04, note,
                         transform=ax.transAxes, fontsize=8, color=col)
 
                 axr = ax.twinx()
