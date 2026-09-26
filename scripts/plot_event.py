@@ -37,7 +37,9 @@ MODELS = [  # 与 plot_compare.py 同步
     ("S.11 MoE+掩膜池", "runs/site_model_moe_mp", "#e7298a"),
 ]
 LOOKBACK = 72
-LEADS = [12, 24]  # 画连续提前量曲线的步数（小时）
+LEADS = [1, 3, 6, 12, 24]  # 画连续提前量曲线的步数（小时）
+LEAD_LW = {1: 2.2, 3: 1.9, 6: 1.5, 12: 1.1, 24: 1.8}
+LEAD_AL = {1: 1.0, 3: 0.90, 6: 0.80, 12: 0.60, 24: 0.95}
 
 
 def load_run(run_dir):
@@ -148,9 +150,8 @@ def main():
                 if not m.any():
                     continue
                 tj, sj = times[tgt[m]], sim[m]
-                lw, alpha = (1.8, 0.95) if lead == max(LEADS) else (1.1, 0.75)
-                ax.plot(tj, sj, color=col, lw=lw, alpha=alpha,
-                        label=f"提前{lead}h预报")
+                ax.plot(tj, sj, color=col, lw=LEAD_LW[lead], alpha=LEAD_AL[lead],
+                        label=f"提前{lead}h")
                 if lead == max(LEADS):
                     nse24 = win_nse(q_raw[tgt[m]], sj)
                     n_lt = int(np.isfinite(q_raw[tgt[m]]).sum())
@@ -168,7 +169,7 @@ def main():
             axr.set_ylim(0, max(8, np.nanmax(area_rain[i, lo:hi]) * 4))
             axr.set_yticks([])
             if r == 0:
-                ax.legend(loc="upper right", fontsize=8, ncol=4)
+                ax.legend(loc="upper right", fontsize=7, ncol=6)
                 ax.set_title(f"事件峰 {times[pk]:%Y-%m-%d %H时}  "
                              f"实测峰 {q_raw[pk]:.0f} m³/s", fontsize=10)
 
