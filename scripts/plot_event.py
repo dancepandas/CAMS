@@ -132,6 +132,14 @@ def main():
         for r, (lab, d, col) in enumerate(runs):
             ax = axes[r]
             ax.plot(tt, obs_win, color="black", lw=1.8, label="实测")
+            # 每条起报的完整 24h 逐小时预报轨迹（细线，显示模型真实输出的
+            # 时间粒度； stitched 折线是 12h 抽样连线的画图假象）
+            mk = d["site"] == i
+            t0s = d["t0"][mk]
+            sel = (t0s + LOOKBACK >= lo - 24) & (t0s + LOOKBACK < hi)
+            for a, row in zip(t0s[sel], d["sim"][mk][sel]):
+                tt_a = times[a + LOOKBACK: a + LOOKBACK + len(row)]
+                ax.plot(tt_a, d["inv"](row, i), color=col, lw=0.7, alpha=0.30)
             nse24 = np.nan
             n_lt = 0
             for lead in LEADS:

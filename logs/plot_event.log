@@ -1,4 +1,4 @@
-D:\chengs\CAMS\scripts\plot_event.py:177: UserWarning: Glyph 9888 (\N{WARNING SIGN}) missing from font(s) Microsoft YaHei.
+D:\chengs\CAMS\scripts\plot_event.py:185: UserWarning: Glyph 9888 (\N{WARNING SIGN}) missing from font(s) Microsoft YaHei.
   fig.savefig(out, dpi=110)
 已写 D:\chengs\CAMS\experiments/forecast_event\03455000_纽波特.png  峰 2024-09-28 01时 3908 m³/s
 已写 D:\chengs\CAMS\experiments/forecast_event\03454500_温泉镇.png  峰 2024-09-27 20时 3766 m³/s
