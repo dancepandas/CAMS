@@ -564,6 +564,7 @@ def train_model(model, ldr, m, out_dir, device):
     opt = torch.optim.Adam(model.parameters(), lr=float(m["lr"]))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(m["epochs"]))
     loss_name = str(m.get("loss", "mse"))
+    delta = float(m.get("huber_delta", 1.0))
     if loss_name == "quantile":
         taus = torch.tensor([float(v) for v in m.get("quantiles", [0.1, 0.5, 0.9])],
                             device=device)
@@ -571,13 +572,8 @@ def train_model(model, ldr, m, out_dir, device):
         print(f"损失 quantile（τ={qs}，pinball，逐站方差归一加权，仅训练）")
     elif loss_name == "huber_nse":
         # E1：Huber(reduction='none') × 样本权重（逐站方差归一），训练批加权、验证不加权
-        delta = float(m.get("huber_delta", 1.0))
         print(f"损失 huber_nse（delta={delta}，逐站方差归一加权，仅训练）")
-    elif loss_name == "huber":
-        lossf = nn.HuberLoss(delta=float(m.get("huber_delta", 1.0)))
-        print(f"损失 {loss_name}")
     else:
-        lossf = nn.MSELoss()
         print(f"损失 {loss_name}")
 
     def run(loader, train):
@@ -588,20 +584,35 @@ def train_model(model, ldr, m, out_dir, device):
                                       for t in (x, hist, frain, idx, y))
             w = w.to(device, non_blocking=True)
             pred = model(x, hist, frain, idx)          # (B, H, K)
+            # 目标缺测掩膜（S.12 起样本允许缺测目标，输入仍要求完整）：
+            # 缺测点损失置零，按各样本有效点数归一，不再整窗丢弃
+            mk = torch.isfinite(y)                     # (B, H)
+            y0 = torch.where(mk, y, torch.zeros_like(y))
+            cnt_raw = mk.sum(dim=tuple(range(1, mk.ndim)))
+            has = cnt_raw > 0                          # 至少 1 个有效目标的样本
+            cnt = cnt_raw.clamp(min=1)
+            ldims = tuple(range(1, pred.ndim))
             if loss_name == "quantile":
-                err = pred - y.unsqueeze(-1)           # (B, H, K)
-                l = torch.maximum(taus * err, (taus - 1) * err)
-                l = l.mean(dim=tuple(range(1, l.ndim)))
-                loss = (l * w).sum() / w.sum() if train else l.mean()
+                err = pred - y0.unsqueeze(-1)          # (B, H, K)
+                l = (torch.maximum(taus * err, (taus - 1) * err)
+                     * mk.unsqueeze(-1))
             else:
-                pred = pred.squeeze(-1)                # (B, H)，单分位点
-            if loss_name == "huber_nse":
-                l = nn.functional.huber_loss(pred, y, delta=delta, reduction="none")
-                # 空间平均到样本级，与权重逐样本相乘
-                l = l.mean(dim=tuple(range(1, l.ndim)))
-                loss = (l * w).sum() / w.sum() if train else l.mean()
-            elif loss_name != "quantile":
-                loss = lossf(pred, y)
+                p = pred.squeeze(-1)                   # (B, H)，单分位点
+                if loss_name in ("huber_nse", "huber"):
+                    l = nn.functional.huber_loss(p, y0, delta=delta,
+                                                 reduction="none") * mk
+                else:
+                    l = ((p - y0) ** 2) * mk
+            # 逐样本按有效点平均，再与权重逐样本相乘（分位数路 K 个头各自计点，
+            # 与旧口径 mean(H,K) 一致，保证验证损失跨方案可比；完全无有效目标的
+            # 样本整体剔除，不计 0 损失拖低均值）
+            K = pred.shape[-1] if loss_name == "quantile" else 1
+            ls = l.sum(dim=ldims) / (cnt * K)
+            if train:
+                wm = w * has
+                loss = (ls * wm).sum() / wm.sum().clamp(min=1e-9)
+            else:
+                loss = ls[has].mean() if has.any() else ls.sum() * 0.0
             if train:
                 opt.zero_grad()
                 loss.backward()
@@ -673,12 +684,15 @@ def main():
     n_win = T - lookback - R + 1
     sd = m.get("split_dates")
     if sd:
-        # 按日期切分（围绕洪水事件设计）：train < sd[0] ≤ val < sd[1] ≤ test
+        # 按日期切分（围绕洪水事件设计）。S.12 起按窗口右端点划线：每个样本的
+        # 预测目标全部落在本段内，杜绝 val 目标窗越界伸进 test 头 3 天
+        # （审计问题 B：早停选模偷看测试段）。
         b1 = int(times.searchsorted(pd.Timestamp(sd[0])))
         b2 = int(times.searchsorted(pd.Timestamp(sd[1])))
         b1 = min(max(b1, 1), n_win - 1)
         b2 = min(max(b2, b1 + 1), n_win)
-        bounds = {"train": (0, b1), "val": (b1, b2), "test": (b2, n_win)}
+        w = lookback + R - 1              # 窗口右端越过起报点的长度（小时）
+        bounds = {"train": (0, b1 - w), "val": (b1, b2 - w), "test": (b2, n_win)}
         print(f"按日期划分  train 至 {times[b1]}  |  val 至 {times[b2]}  |  "
               f"test 至 {times[-1]}")
     else:
@@ -743,7 +757,10 @@ def main():
                 h = flow_n[i, t0:t0 + lookback]
                 y = flow_n[i, t0 + lookback:t0 + lookback + R]
                 r = rain_n[i, t0:t0 + lookback + R]
-                if (np.isfinite(h).all() and np.isfinite(y).all()
+                # 输入（历史流量+降雨）必须完整；目标允许缺测——损失与指标对
+                # 缺测点逐点屏蔽（S.12 起；审计问题 A：整窗剔除会系统性丢掉
+                # 缺测常与洪水同期的那部分窗口，测试集被悄悄换成容易版本）
+                if (np.isfinite(h).all() and np.isfinite(y).any()
                         and np.isfinite(r).all()):
                     ss.append((i, t0))
         samples[sp] = ss
@@ -847,9 +864,10 @@ def main():
                 continue
             o = inv_fit(fo[mk], i).ravel()
             s = inv_fit(fs[mk], i).ravel()
-            ns_fit.append(nse(o, s))
-            print(f"{ids[i]:11s} {names[i]:10s} NSE {nse(o, s):6.3f}  "
-                  f"MAE {np.mean(np.abs(o - s)):8.3f}")
+            fin = np.isfinite(o) & np.isfinite(s)   # 缺测目标不计入背数检查
+            ns_fit.append(nse(o[fin], s[fin]))
+            print(f"{ids[i]:11s} {names[i]:10s} NSE {ns_fit[-1]:6.3f}  "
+                  f"MAE {np.mean(np.abs(o[fin] - s[fin])):8.3f}")
         print(f"训练段中位 NSE {np.median(ns_fit):.3f}")
 
     obs_l, sim_l, site_l, t0_l = [], [], [], []
@@ -933,19 +951,35 @@ def main():
         mk = st == i
         if mk.sum() == 0:
             continue
-        obs = inv(obs_n[mk], i).ravel()
-        sim = inv(sim_n[mk], i).ravel()
-        per = inv(np.repeat(obs_n[mk][:, :1], R, axis=1), i).ravel()
+        oo = inv(obs_n[mk], i)
+        ss = inv(sim_n[mk], i)
+        fin = np.isfinite(oo) & np.isfinite(ss)   # 目标缺测逐点剔除（S.12）
+        obs, sim = oo[fin], ss[fin]
+        if obs.size < 4:
+            print(f"{ids[i]:11s} {names[i]:10s} {areas[i]:6.0f} 有效点不足，跳过")
+            continue
+        # 持续性 = 锚点实测（起报前最后 1h，t0+71）；不用 obs[:,0]（那是 t0+72，
+        # 起报时不可能知道，等于偷看 1h——审计问题 C）
+        anchor = flow_n[st[mk], t0_arr[mk] + lookback - 1]
+        per = inv(np.repeat(anchor[:, None], R, axis=1), i)[fin]   # 与 obs/sim 同口径屏蔽
         a, b = nse(obs, sim), nse(obs, per)
         ka, r, al, be = kge(obs, sim)
         kp = kge(obs, per)[0]
-        op = inv(obs_n[mk], i).max(axis=1)
-        sp = inv(sim_n[mk], i).max(axis=1)
-        big = op >= np.quantile(op, 0.9)
+        op = np.nanmax(oo, axis=1)
+        sp = np.nanmax(ss, axis=1)
+        big = op >= np.nanquantile(op, 0.9)
         if big.sum():
-            bo.append(inv(obs_n[mk], i)[big].ravel())
-            bs.append(inv(sim_n[mk], i)[big].ravel())
-        pkb = np.median((sp[big] - op[big]) / np.maximum(op[big], 1e-6)) if big.sum() else np.nan
+            of, sf = oo[big].ravel(), ss[big].ravel()
+            finp = np.isfinite(of) & np.isfinite(sf)
+            bo.append(of[finp])
+            bs.append(sf[finp])
+            # 峰偏差只在整行（R 步）都干净的样本上算
+            ok = finp.reshape(int(big.sum()), -1).all(axis=1)
+            pkb = (np.median((sp[big][ok] - op[big][ok])
+                             / np.maximum(op[big][ok], 1e-6))
+                   if ok.sum() else np.nan)
+        else:
+            pkb = np.nan
         rows.append((a, b, ka, kp))
         print(f"{ids[i]:11s} {names[i]:10s} {areas[i]:6.0f} {a:7.3f} {b:8.3f} | "
               f"{ka:7.3f} {kp:8.3f} | {r:5.2f} {al:7.2f} {be:7.2f} | {pkb:7.1%}")
@@ -978,7 +1012,12 @@ def main():
         if mk.sum() == 0:
             continue
         oo, ss = inv(obs_n[mk], i), inv(sim_n[mk], i)
-        lead_rows.append([nse(oo[:, L - 1], ss[:, L - 1]) for L in leads])
+        row = []
+        for L in leads:
+            o, s = oo[:, L - 1], ss[:, L - 1]
+            fin = np.isfinite(o) & np.isfinite(s)
+            row.append(nse(o[fin], s[fin]) if fin.sum() >= 4 else np.nan)
+        lead_rows.append(row)
     lr_arr = np.asarray(lead_rows)
     lead_med = np.median(lr_arr, axis=0)
     print("\n预见期  " + "  ".join(f"{L:+3d}h" for L in leads))

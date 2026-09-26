@@ -35,6 +35,7 @@ MODELS = [  # 与 plot_compare.py 同步
     ("S.7 掩膜池化", "runs/site_model_dlmcnn_mp", "#a65628"),
     ("S.10 MoE双专家", "runs/site_model_moe", "#1b9e77"),
     ("S.11 MoE+掩膜池", "runs/site_model_moe_mp", "#e7298a"),
+    ("S.12 MoE+滑窗3h", "runs/site_model_step12", "#d73027"),
 ]
 LOOKBACK = 72
 LEADS = [1, 3, 6, 12, 24]  # 画连续提前量曲线的步数（小时）

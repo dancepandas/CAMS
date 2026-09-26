@@ -30,13 +30,13 @@ from train import (MoENet, SiteDataset, apply_overrides, build_statics,
 
 LEADS = [1, 3, 6, 12]          # 用户指定的时间尺度
 STRIDE = 1                     # 起报原点逐小时
-PARAM_EXPECT = {"moe": 162.7}  # 存档日志参数量（千），构造自检
+PARAM_EXPECT = {"moe": 162.7, "step12": 162.7}  # 存档日志参数量（千），构造自检
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="moe",
-                    choices=["moe"], help="run 目录名（runs/site_model_<run>）")
+                    choices=["moe", "step12"], help="run 目录名（runs/site_model_<run>）")
     ap.add_argument("--roll", type=int, default=max(LEADS))
     args = ap.parse_args()
     R = args.roll
