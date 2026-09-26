@@ -38,8 +38,8 @@ MODELS = [  # 与 plot_compare.py 同步
 ]
 LOOKBACK = 72
 LEADS = [1, 3, 6, 12, 24]  # 画连续提前量曲线的步数（小时）
-LEAD_LW = {1: 2.2, 3: 1.9, 6: 1.5, 12: 1.1, 24: 1.8}
-LEAD_AL = {1: 1.0, 3: 0.90, 6: 0.80, 12: 0.60, 24: 0.95}
+# 提前量配色：近=红暖色，远=蓝冷色（RdYlBu_r 取色），一眼区分
+LEAD_COL = {1: "#a50026", 3: "#f46d43", 6: "#fdae61", 12: "#74add1", 24: "#4575b4"}
 
 
 def load_run(run_dir):
@@ -150,7 +150,7 @@ def main():
                 if not m.any():
                     continue
                 tj, sj = times[tgt[m]], sim[m]
-                ax.plot(tj, sj, color=col, lw=LEAD_LW[lead], alpha=LEAD_AL[lead],
+                ax.plot(tj, sj, color=LEAD_COL[lead], lw=1.6, marker="o", ms=2.5,
                         label=f"提前{lead}h")
                 if lead == max(LEADS):
                     nse24 = win_nse(q_raw[tgt[m]], sj)
