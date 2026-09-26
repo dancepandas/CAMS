@@ -1,0 +1,17 @@
+D:\chengs\CAMS\scripts\plot_event.py:177: UserWarning: Glyph 9888 (\N{WARNING SIGN}) missing from font(s) Microsoft YaHei.
+  fig.savefig(out, dpi=110)
+已写 D:\chengs\CAMS\experiments/forecast_event\03455000_纽波特.png  峰 2024-09-28 01时 3908 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03454500_温泉镇.png  峰 2024-09-27 20时 3766 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03453500_马歇尔.png  峰 2024-09-28 00时 3285 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03451500_阿什维尔.png  峰 2024-09-27 21时 3143 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03447687_弗莱彻.png  峰 2024-09-27 23时 1897 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03443000_布兰太尔.png  峰 2024-09-28 11时 827 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03453000_艾维河.png  峰 2024-09-27 15时 473 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03451000_斯旺纳诺阿.png  峰 2024-09-27 19时 1722 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\0344878100_霍米尼溪.png  峰 2024-09-27 16时 968 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03439000_罗斯曼.png  峰 2024-09-27 15时 345 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03446000_米尔斯河.png  峰 2024-09-27 16时 804 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\0344632850_马德溪.png  峰 2024-09-27 11时 175 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03441000_戴维森河.png  峰 2024-09-27 15时 300 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\0344894205_北叉斯旺纳诺阿.png  峰 2024-09-27 17时 394 m³/s
+已写 D:\chengs\CAMS\experiments/forecast_event\03450000_比特里溪.png  峰 2024-09-27 14时 226 m³/s
