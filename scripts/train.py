@@ -2,18 +2,22 @@
 # -*- coding: utf-8 -*-
 """断面流量预报：训练与评估。
 
-一个共享权重的模型同时服务流域内多个断面，预报未来若干小时的流量过程。
-输入分三路：历史流量与历史面雨量（时序）、预见期内的面雨量（时序）、
-汇水区内的多尺度累积降雨图与静态场（空间）。目标为逐站标准化后的对数流量，
-模型预测相对窗口末刻的增量。
+一个共享权重的模型同时服务流域内多个断面。主模型的历史支路接收流量序列，
+降雨由格点空间支路和预见期支路提供；DLinear 对照模型也可改用面雨量标量。
+目标语义由 ``model.output_mode`` 决定：``delta`` 预测相对窗口末刻实测的增量，
+``level`` 直接预测下一时刻的标准化流量数值。S.14/S.18 修正版使用后者。
 
-用法: python3 scripts/pipeline/train.py [--config configs/pipeline.yaml]
-                                        [--set model.epochs=8]
+训练入口先执行数据门禁：站序、时间、网格、坐标系以及面雨量的源降雨摘要
+必须全部一致；训练目标必须早于 2023，2023 只作验证，2024 只作最终评估。
+
+用法: python3 scripts/train.py [--config configs/pipeline.yaml]
+                                 [--set model.epochs=8]
 """
 import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -24,6 +28,10 @@ from torch.utils.data import DataLoader, Dataset
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+
+from data_contract import (MANIFEST_FORMAT, assert_calendar_splits,
+                           validate_data_contract, write_training_manifest)
 
 
 def load_config(path):
@@ -45,27 +53,16 @@ def apply_overrides(cfg, items):
     return cfg
 
 
-def load_inputs(cfg):
+def load_inputs(cfg, contract=None):
     """读站点表、面雨量、各断面流量，按共同时间轴对齐。"""
-    p = cfg["paths"]
-    sites = pd.read_csv(os.path.join(ROOT, p["sites_csv"]), encoding="utf-8",
-                        dtype={"site_id": str})
-    ids = [str(s) for s in sites["site_id"]]
-    names = list(sites["name"])
-    areas = sites["area_km2"].to_numpy(dtype=np.float64)
-
-    a = np.load(os.path.join(ROOT, p["area_rain"]), allow_pickle=True)
-    times = pd.DatetimeIndex([str(t) for t in a["times"]])
-    area_rain = a["area_rain"].astype(np.float64)
-    if area_rain.shape[0] != len(ids):
-        raise ValueError(f"面雨量断面数 {area_rain.shape[0]} 与站点表 {len(ids)} 不符")
-
-    flow = np.full_like(area_rain, np.nan)
-    for i, sid in enumerate(ids):
-        f = os.path.join(ROOT, p["sites"], f"{sid}.csv")
-        q = pd.read_csv(f, index_col=0, parse_dates=True)["flow_m3s"]
-        q.index = q.index.tz_localize(None)
-        flow[i] = q.reindex(times).values
+    if contract is None:
+        contract = validate_data_contract(cfg, ROOT)
+    ids = list(contract.ids)
+    names = list(contract.names)
+    areas = contract.areas.copy()
+    times = contract.times
+    area_rain = contract.area_rain
+    flow = contract.flow
     return ids, names, areas, times, area_rain, flow
 
 
@@ -79,9 +76,13 @@ class SiteDataset(Dataset):
 
     def __init__(self, cs, statics, flow_n, rain_n, samples,
                  use_spatial, use_future, horizon, lookback, weights=None,
-                 areal=False, mask_ch=False):
+                 areal=False, mask_ch=False, output_mode="delta"):
         self.cs, self.statics = cs, statics
         self.flow_n, self.rain_n = flow_n, rain_n
+        # delta（默认）：目标是相对窗末实测的增量，持续性预报 = 输出全零。
+        # level（S.14）：目标直接是下一时刻的流量数值本身，没有"输出零即持续"
+        # 这个便利，模型必须自己学会贴着窗末实测值走。
+        self.output_mode = str(output_mode)
         self.samples = np.asarray(samples, dtype=np.int64)  # (n, 2) 便于整批索引
         self.use_spatial, self.use_future = use_spatial, use_future
         # DLinear 模式：不喂降雨图，改喂 3 个面雨量标量（见 __getitem__）
@@ -101,7 +102,7 @@ class SiteDataset(Dataset):
         t = t0 + self.lookback - 1
         hist = self.flow_n[i, t0:t0 + self.lookback]
         tgt = self.flow_n[i, t0 + self.lookback:t0 + self.lookback + self.horizon]
-        delta = tgt - hist[-1]
+        target = tgt if self.output_mode == "level" else tgt - hist[-1]
 
         if self.use_spatial:
             # 空间支路：汇水区掩膜裁剪后的两张图——最近 1h 降雨、72h 累计降雨；
@@ -121,7 +122,7 @@ class SiteDataset(Dataset):
                 return (x,
                         torch.tensor(hist[:, None], dtype=torch.float32),
                         fut.unsqueeze(0),
-                        i, torch.tensor(delta, dtype=torch.float32),
+                        i, torch.tensor(target, dtype=torch.float32),
                         self.weights[k])
             rnow = self.cs[t] - (self.cs[t - 1] if t > 0 else 0.0)
             lo = max(0, t - 71)
@@ -147,7 +148,7 @@ class SiteDataset(Dataset):
         return (torch.tensor(x, dtype=torch.float32),
                 torch.tensor(hist[:, None], dtype=torch.float32),
                 torch.tensor(fut, dtype=torch.float32),
-                i, torch.tensor(delta, dtype=torch.float32),
+                i, torch.tensor(target, dtype=torch.float32),
                 self.weights[k])
 
 
@@ -158,9 +159,12 @@ def make_loader(ds, batch_size, shuffle, device, num_workers=0):
     放到 GPU 上既省内存又能让 __getitem__ 只回传小切片。
     """
     if device.type == "cuda":
-        if ds.cs is not None:
+        # cs 可能已被上一处统一搬到显存了（三个数据集共用同一个张量），
+        # 这里只在它还是 numpy 数组时才搬，避免同一块大数组被搬三份。
+        if ds.cs is not None and not torch.is_tensor(ds.cs):
             ds.cs = torch.from_numpy(ds.cs).to(device)      # 常驻 GPU
-        ds.statics = torch.from_numpy(ds.statics).to(device)
+        if not torch.is_tensor(ds.statics):
+            ds.statics = torch.from_numpy(ds.statics).to(device)
     # 空间输入已常驻 GPU，其余小切片就地创建，无需 pin_memory
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=False)
@@ -270,7 +274,8 @@ class Net(nn.Module):
         else:
             feats = [h[-1]]
         if self.use_spatial:
-            # 历史态两张图（当前 1h + 72h 平均）与预见期降雨图（下一小时）各自卷积
+            # 历史态两张图（当前 1h + 过去最多 72h 累计）与预见期降雨图
+            # （下一小时）各自卷积；这里不是 72h 平均值。
             m = x[:, 2:3] if self.masked_pool else None
             f = self.cnn(x[:, :2] if self.masked_pool else x)
             feats.append(self.proj(pool2d(f, m)))
@@ -291,7 +296,7 @@ class Net(nn.Module):
 class DLinearNet(nn.Module):
     """DLinear（Zeng et al., AAAI'23）共享权重移植：移动平均分解趋势/季节，
     两支各一个线性层相加。arch="dlinear" 时仅收流量历史 + 3 个面雨量标量
-    （当前 1h、72h 均值、下一小时，均已标准化）；arch="dlinear_cnn" 时
+    （当前 1h、过去最多 72h 累计、下一小时，均已标准化）；arch="dlinear_cnn" 时
     改收 S.4 的空间分支（2 通道降雨图 CNN + 下一小时降雨图 CNN，池化后
     拼进季节支）——把 S.4 的价值拆成"空间编码"与"时序主干"两部分对照。
     """
@@ -450,15 +455,36 @@ def make_inv(transform, q_mean, q_std, lams):
     return lambda z, i: np.expm1(np.asarray(z) * q_std[i] + q_mean[i])
 
 
-def unrolled_loss(model, idx, t0, flow_g, cs_g, st_g, w, K, lookback,
-                  use_spatial, use_future, ar, delta):
-    """把模型自己的预测喂回历史窗，滚动 K 步，返回每步损失均值（E1 加权）。
+def unrolled_steps(model, idx, t0, flow_g, fin_g, cs_g, st_g, w, K, lookback,
+                   use_spatial, use_future, ar, output_mode, taus=None,
+                   huber_delta=1.0, bias_pen=0.0):
+    """闭环滚动训练：逐步生成损失，每步把模型自己的预测喂回历史窗。
 
-    与推理滚动完全同构：除起报窗外不用实测流量；损失打在滚动每一步上，
-    涨水过程的每一步都有梯度，教师强迫的曝光偏差由此根治。
+    与推理滚动完全同构：除起报窗外不用实测流量。和旧版 full-BPTT 展开的区别：
+
+    - 支持 output_mode="level"：模型输出直接是流量数值本身，真值也取流量，
+      回灌预测值时**不再加末刻锚**（加锚是 delta 语义，level 下是双重计数）。
+    - 支持分位数损失（taus 非空时对全部量化头算 pinball，逐头取均值）。
+    - 预测回灌默认断梯度（scheduled sampling 式截断反传）：模型照样"看见"
+      自己的预测当输入、学到对偏差输入纠偏，但只需常驻单步计算图——
+      全量 BPTT 要同时保住 K 步图，K=24 时显存直接翻倍起步。
+    - 目标缺测防护：flow_g 里缺测已被 nan_to_num 填 0，必须乘回原始有限掩膜，
+      否则缺测时刻的真值 0 会污染损失（教师强迫路径靠 Dataset 的掩膜，
+      这里自己算）。
+    - bias_pen（S.20 第一级，治滚动漂移的对称惩罚）：>0 时逐步额外罚
+      「该提前量的有符号平均偏差绝对值」。为什么加它：纯闭环监督的隐性
+      副作用是模型靠整体压低预测当漂移刹车（S.18 闭环实验洪峰 +10.3%→
+      -16.1% 的代价就是这么来的）——单步 loss 只管"这一步报准"，看不见
+      "偏差的符号会滚到深处"。这里把每个提前量的偏差绝对值直接摆进损失，
+      且按提前量线性加权（越深罚越重，因为漂移随深度复利放大），惩罚是对
+      称的：只罚"偏了"，不指定往哪偏，模型只能靠逐步报准来满足它。
+      注意逐站分别算有符号偏差再取绝对值平均——批内大小站混算会让正负
+      互相抵消，小站的漂移信号会被大站淹没。
+
+    返回生成器，逐步 yield 加权平均损失（标量张量，带计算图）。
     """
     cur = flow_g[idx[:, None], t0[:, None] + ar[None, :]].clone()   # (B, LB)
-    tot = 0.0
+    n_sites = flow_g.shape[0]
     for k in range(K):
         t = t0 + lookback - 1 + k                                   # 当前末刻 (B,)
         if use_spatial:
@@ -468,7 +494,7 @@ def unrolled_loss(model, idx, t0, flow_g, cs_g, st_g, w, K, lookback,
             base = cs_g[(lo - 1).clamp_min(0)] * (lo > 0).float()[:, None, None]
             rain72 = cs_g[t] - base                                  # 72h 累计
             x = torch.stack([rnow * mk, rain72 * mk], 1)             # (B,2,G,G)
-            if model.masked_pool:
+            if getattr(model, "masked_pool", False):
                 x = torch.cat([x, mk.unsqueeze(1)], 1)               # 掩膜作第3通道
             fut = ((cs_g[t + 1] - cs_g[t]) * mk).unsqueeze(1)       # 下一小时降雨图
             if not use_future:
@@ -479,34 +505,72 @@ def unrolled_loss(model, idx, t0, flow_g, cs_g, st_g, w, K, lookback,
             x = torch.zeros((len(idx), 1, 1, 1), device=flow_g.device)
             fut = None
         hist = cur.unsqueeze(-1)                                    # (B,LB,1) 仅流量
-        d_pred = model(x, hist, fut, idx)[:, 0, model.mid]          # 中位分位点
-        y = flow_g[idx, t + 1] - flow_g[idx, t]                     # 真值增量（锚定实测末刻）
-        l = nn.functional.huber_loss(d_pred, y, delta=delta, reduction="none")
-        tot = tot + (l * w).sum() / w.sum()
-        nxt = cur[:, -1] + d_pred
-        cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)
-    return tot / K
+        pred = model(x, hist, fut, idx)[:, 0, :]                    # (B,Q) 全部量化头
+        y = flow_g[idx, t + 1]                                      # 下一时刻真值
+        ok = fin_g[idx, t + 1].float()                              # 目标缺测掩膜
+        if taus is not None:
+            err = pred - y.unsqueeze(-1)                            # (B,Q)
+            l = torch.maximum(taus * err, (taus - 1) * err).mean(-1)
+        else:
+            l = nn.functional.huber_loss(pred[:, model.mid], y,
+                                         delta=huber_delta, reduction="none")
+        # 缺测点损失置零；权重同样乘掩膜，缺测样本不再贡献分母
+        denom = (w * ok).sum().clamp(min=1e-9)
+        loss = ((l * ok) * w).sum() / denom
+        if bias_pen > 0.0:
+            # 逐站有符号偏差（标准化单位），再取绝对值平均；按提前量线性加权。
+            # 只罚中位头——0.1/0.9 头的偏差是模型刻意留的不确定带，不该罚。
+            err_mid = pred[:, model.mid] - y                       # (B,)
+            b_sum = torch.zeros(n_sites, device=pred.device)
+            b_den = torch.zeros(n_sites, device=pred.device)
+            b_sum.index_add_(0, idx, err_mid * ok * w)
+            b_den.index_add_(0, idx, ok * w)
+            present = b_den > 0
+            bias_site = (b_sum[present] / b_den[present].clamp(min=1e-9)).abs().mean()
+            loss = loss + bias_pen * (k + 1) / K * bias_site
+        yield loss
+        # level：输出即流量数值，直接回灌（断梯度）；delta：末刻锚定 + 增量
+        nxt = pred[:, model.mid] if output_mode == "level" \
+            else cur[:, -1] + pred[:, model.mid]
+        cur = torch.cat([cur[:, 1:], nxt.detach().unsqueeze(1)], 1)
 
 
 def train_model_unrolled(model, ds_tr, ds_va, m, out_dir, device):
-    """展开式训练：训练/验证都在滚动条件下算损失，选模型与推理任务一致。"""
+    """闭环滚动训练：训练/验证都在滚动条件下算损失，选模型与推理任务一致。
+
+    逐步损失各自反向传播（梯度累加后统一裁剪、更新），任意时刻只常驻
+    单步计算图——K=24 的闭环训练在 24 GB 显存上才跑得动。
+    """
     K = int(m["unroll"])
     lookback = ds_tr.lookback
     use_spatial, use_future = ds_tr.use_spatial, ds_tr.use_future
+    output_mode = ds_tr.output_mode
+    every = max(1, int(m.get("unroll_every", 1)))
     delta = float(m.get("huber_delta", 1.0))
+    bias_pen = float(m.get("bias_pen", 0.0))   # S.20：>0 逐步加对称漂移惩罚（见 unrolled_steps）
+    loss_name = str(m.get("loss", "mse"))
+    taus = None
+    if loss_name == "quantile":
+        taus = torch.tensor([float(v) for v in m.get("quantiles", [0.1, 0.5, 0.9])],
+                            device=device)
     bs, epochs = int(m["batch_size"]), int(m["epochs"])
     opt = torch.optim.Adam(model.parameters(), lr=float(m["lr"]))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     ar = torch.arange(lookback, device=device)
     flow_tr = torch.from_numpy(np.nan_to_num(ds_tr.flow_n, nan=0.0)).float().to(device)
+    fin_tr = torch.from_numpy(np.isfinite(ds_tr.flow_n)).to(device)
     flow_va = torch.from_numpy(np.nan_to_num(ds_va.flow_n, nan=0.0)).float().to(device)
+    fin_va = torch.from_numpy(np.isfinite(ds_va.flow_n)).to(device)
     w_all = torch.as_tensor(ds_tr.weights, device=device)
     sam_tr = torch.as_tensor(ds_tr.samples, device=device)          # (n,2) 站号, t0
     sam_va = torch.as_tensor(ds_va.samples, device=device)
-    cs_tr, st_tr = ds_tr.cs, ds_tr.statics                          # make_loader 已挪 GPU
+    if every > 1:                                   # 闭环 K 步成本≈K 倍单步，
+        sam_tr = sam_tr[::every]                    # 抽稀训练样本把单轮耗时压回来；
+    cs_tr, st_tr = ds_tr.cs, ds_tr.statics          # 抽样密度对早停选模无偏，只是方差略升
     cs_va, st_va = ds_va.cs, ds_va.statics
-    print(f"展开式训练 unroll={K}：滚动 {K} 步逐步回灌，损失打在每步上"
-          f"（训练加权、验证不加权）")
+    print(f"闭环滚动训练 unroll={K}（每 {every} 取 1 样本，共 {len(sam_tr):,} 条）"
+          f"：逐步回灌自身预测、断梯度，损失打在每步上（{loss_name}）"
+          + (f"，对称漂移惩罚 bias_pen={bias_pen}" if bias_pen > 0 else ""))
 
     def run_train():
         model.train(True)
@@ -515,14 +579,15 @@ def train_model_unrolled(model, ds_tr, ds_va, m, out_dir, device):
         for j in range(0, len(sam_tr), bs):
             sel = perm[j:j + bs]
             s = sam_tr[sel]
-            loss = unrolled_loss(model, s[:, 0], s[:, 1], flow_tr, cs_tr, st_tr,
-                                 w_all[sel], K, lookback, use_spatial,
-                                 use_future, ar, delta)
             opt.zero_grad()
-            loss.backward()
+            for step_loss in unrolled_steps(
+                    model, s[:, 0], s[:, 1], flow_tr, fin_tr, cs_tr, st_tr,
+                    w_all[sel], K, lookback, use_spatial, use_future, ar,
+                    output_mode, taus, delta, bias_pen):
+                step_loss.backward()                # 单步图用完即释放
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            tot += loss.item() * len(sel)
+            tot += step_loss.item() * len(sel)
             n += len(sel)
         return tot / max(n, 1)
 
@@ -533,10 +598,11 @@ def train_model_unrolled(model, ds_tr, ds_va, m, out_dir, device):
             for j in range(0, len(sam_va), bs):
                 s = sam_va[j:j + bs]
                 w = torch.ones(len(s), device=device)
-                loss = unrolled_loss(model, s[:, 0], s[:, 1], flow_va, cs_va, st_va,
-                                     w, K, lookback, use_spatial, use_future,
-                                     ar, delta)
-                tot += loss.item() * len(s)
+                sl = list(unrolled_steps(
+                    model, s[:, 0], s[:, 1], flow_va, fin_va, cs_va, st_va,
+                    w, K, lookback, use_spatial, use_future, ar,
+                    output_mode, taus, delta, bias_pen))
+                tot += (sum(v.item() for v in sl) / len(sl)) * len(s)
                 n += len(s)
         return tot / max(n, 1)
 
@@ -548,10 +614,276 @@ def train_model_unrolled(model, ds_tr, ds_va, m, out_dir, device):
         if va < best:
             best, wait = va, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            # 每刷新一次最优就落盘一次：闭环训练一轮要好几个小时，
+            # 只在收尾存盘的话，中途断电就整夜白训。最优权重才 0.7 MB，写得起。
+            torch.save(best_state, os.path.join(out_dir, "best.pt"))
         else:
             wait += 1
         if ep % 5 == 0 or ep == 1:
-            print(f"  第 {ep:3d} 轮  训练 {tr:.4f}  验证 {va:.4f}")
+            print(f"  第 {ep:3d} 轮  训练 {tr:.4f}  验证 {va:.4f}", flush=True)
+        if wait >= int(m["patience"]):
+            print(f"  第 {ep} 轮早停")
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    torch.save(model.state_dict(), os.path.join(out_dir, "best.pt"))
+
+
+def unrolled_bptt_loss(model, idx, t0, flow_g, fin_g, cs_g, st_g, w, K, lookback,
+                       use_spatial, use_future, ar, output_mode, taus=None,
+                       huber_delta=1.0, bias_pen=0.0, adv_weight=1.0,
+                       bias_pen_mode="abs", bias_pen_over=0.0, use_ckpt=True):
+    """S.20 第二级：整条 K 步闭环轨迹不断梯度（full BPTT），直接优化部署成绩。
+
+    与 unrolled_steps（断梯度逐步损失）的本质区别：
+
+    - 回灌的预测值**不截断梯度**："第 1 步输出"能收到"第 20 步成绩"的反向
+      传播。模型因此获得第二根杠杆——可以学会"看到历史窗里是自己的预测
+      时做针对性修正"，而不是像逐步目标那样只剩"调全局输出水位"一根杠杆
+      （S.18 闭环 / S.20 第一级两次"治好漂移但压掉洪峰"都是这根杠杆的杰作）。
+    - 显存对策：逐步前向包在梯度检查点里（torch.utils.checkpoint），反向时
+      重算激活。常驻的只有各步输入（历史窗 + 降雨图切片），K=24、批 128 时
+      约 1 GB 量级；若不检查点，24 步 CNN 激活要常驻，批 128 也直接爆。
+    - 目标函数三项（全部可导、全部在整条轨迹上算）：
+        1. 逐步分位数/Huber 损失的逐步平均（保精度底）；
+        2. adv_weight × 逐站"对持续性基准的 NSE 提升量"取负——和 S.16 PPO
+           的奖励同一思想，但用精确梯度替代采样梯度：模型必须滚动 24 步后
+           仍赢过"把起报末刻实测平推 24 小时"的笨基准，逐站算、逐站保护，
+           不让大站的分差掩盖小站（S.17 被汇总中位数误导的教训）；
+        3. bias_pen × 逐站逐 lead 有符号偏差绝对值（同第一级，随 lead
+           线性加权），小权重留着——漂移的显性约束，权重不宜大（第一级
+           证明深端大权重会把共享权重整个拉低）。
+
+    返回 (标量损失, (三项分解))，损失带完整计算图，调用方自行 backward 一次。
+    """
+    import torch.utils.checkpoint as ckpt
+    cur = flow_g[idx[:, None], t0[:, None] + ar[None, :]].clone()   # (B, LB)
+    anchor = cur[:, -1]                                             # (B,) 持续性锚
+    n_sites = flow_g.shape[0]
+
+    def one_step(hist, k):
+        """单步前向。空间输入构建放内部：检查点重算时顺带重建，带梯度的
+        输入只有 hist（历史窗）；降雨切片从 cs_g 现取（数据无梯度）。"""
+        t = t0 + lookback - 1 + k
+        if use_spatial:
+            mk = st_g[idx][:, 0]
+            rnow = cs_g[t] - cs_g[t - 1]
+            lo = (t - 71).clamp_min(0)
+            base = cs_g[(lo - 1).clamp_min(0)] * (lo > 0).float()[:, None, None]
+            rain72 = cs_g[t] - base
+            x = torch.stack([rnow * mk, rain72 * mk], 1)
+            if getattr(model, "masked_pool", False):
+                x = torch.cat([x, mk.unsqueeze(1)], 1)
+            fut = ((cs_g[t + 1] - cs_g[t]) * mk).unsqueeze(1)
+            if not use_future:
+                fut = torch.zeros_like(fut)
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            fut = torch.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            x = torch.zeros((len(idx), 1, 1, 1), device=flow_g.device)
+            fut = None
+        return model(x, hist, fut, idx)[:, 0, :]                    # (B,Q)
+
+    preds = []
+    for k in range(K):
+        hist = cur.unsqueeze(-1)                                    # (B,LB,1)
+        if use_ckpt and torch.is_grad_enabled():
+            pred = ckpt.checkpoint(one_step, hist, k, use_reentrant=False)
+        else:
+            pred = one_step(hist, k)
+        preds.append(pred)
+        nxt = pred[:, model.mid] if output_mode == "level" \
+            else cur[:, -1] + pred[:, model.mid]
+        cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)          # 不断梯度
+    P = torch.stack(preds, 1)                                       # (B,K,Q)
+
+    # 真值/掩膜：目标下标 = t0 + lookback + k（与 unrolled_steps 一致）
+    off = torch.arange(K, device=flow_g.device)
+    t_end = t0[:, None] + lookback + off[None, :]                   # (B,K)
+    Y = flow_g[idx[:, None], t_end]
+    OK = fin_g[idx[:, None], t_end].float()
+
+    # ---- 项 1：逐步损失平均（缺测置零、权重乘掩膜，口径同 unrolled_steps） ----
+    if taus is not None:
+        err = P - Y.unsqueeze(-1)                                   # (B,K,Q)
+        l = torch.maximum(taus * err, (taus - 1) * err).mean(-1)    # (B,K)
+    else:
+        l = nn.functional.huber_loss(P[:, :, model.mid], Y,
+                                     delta=huber_delta, reduction="none")
+    denom = (w[:, None] * OK).sum(dim=0).clamp(min=1e-9)            # (K,)
+    quant = (((l * OK) * w[:, None]).sum(dim=0) / denom).mean()
+
+    # ---- 项 3：逐站逐 lead 有符号偏差惩罚（随 lead 线性加权） ----
+    # 注意必须在项 2 之前算好 pen：项 2 的"整批被闸门剔光"早退分支要引用它。
+    #
+    # bias_pen_mode 三种（S.20 三级实验的教训：闭环漂移方向天生向上，"abs"
+    # 对称惩罚的均衡点永远在零下——BPTT 版三小站全部负偏、洪峰 -17.8% 就是
+    # 证据。模型永远选择"往下压"这条捷径）：
+    #   "abs"  对称：罚 |偏差|（均衡点在零下，会牺牲洪峰）；
+    #   "under"只罚低估（relu(-偏差)）：禁止往下压这条捷径，逼模型用真本事
+    #          治漂移——代价是可能整体偏高、正向漂移失锁，靠逐步项拉住；
+    #   "over" 只罚高估：反向对照（预计没用，留作消融）；
+    #   "asym" 双边不同权重：under 侧用 bias_pen、over 侧用 bias_pen_over
+    #          （< bias_pen）。单边罚实验里它是最优方向的微调——比特里溪的
+    #          正漂移（+14.9%）需要 over 侧轻轻拉住，但权重必须明显小于
+    #          under 侧，否则均衡点又掉回零下、洪峰再被连坐。
+    mid = P[:, :, model.mid]                                        # (B,K)
+    pen = torch.zeros((), device=mid.device)
+    if bias_pen > 0.0:
+        b_sum = torch.zeros(n_sites, K, device=mid.device)
+        b_den = torch.zeros(n_sites, K, device=mid.device)
+        b_sum.index_add_(0, idx, (mid - Y) * OK * w[:, None])
+        b_den.index_add_(0, idx, OK * w[:, None])
+        present = b_den > 0
+        signed = torch.where(
+            present, b_sum / b_den.clamp(min=1e-9), torch.zeros_like(b_sum))
+        if bias_pen_mode == "under":
+            bias_site = bias_pen * torch.relu(-signed)   # 只罚低估（负偏差）
+        elif bias_pen_mode == "over":
+            bias_site = bias_pen * torch.relu(signed)    # 只罚高估（正偏差）
+        elif bias_pen_mode == "asym":
+            # 双边不同权重：under 侧用 bias_pen、over 侧用 bias_pen_over
+            # （必须明显小于 under 侧，否则均衡点又掉回零下、洪峰再被连坐）。
+            # 单边罚实验里它是最优方向的微调——比特里溪的正漂移（+14.9%）
+            # 需要 over 侧轻轻拉住。
+            bias_site = (bias_pen * torch.relu(-signed)
+                         + bias_pen_over * torch.relu(signed))
+        else:                                            # "abs" 对称
+            bias_site = bias_pen * signed.abs()
+        # 缺测 lead 已置零：每站"惩罚总和 ÷ 有数据 lead 数"再跨站平均
+        pen = (bias_site.sum(1)
+               / present.sum(1).clamp(min=1).float()).mean()
+
+    # ---- 项 2：逐站 NSE 提升量（相对持续性基准）取负 ----
+    def site_sum(v):                                                # (B,K) → (站,)
+        out = torch.zeros(n_sites, device=v.device)
+        return out.index_add_(0, idx, (v * OK).sum(1))
+    cnt = torch.zeros(n_sites, device=mid.device)
+    cnt.index_add_(0, idx, OK.sum(1))
+    sum_y = site_sum(Y)
+    sse_sim = site_sum((mid - Y) ** 2)
+    sse_per = site_sum((anchor[:, None] - Y) ** 2)
+    sse_tot = site_sum(Y ** 2)
+    good = cnt >= 4
+    c = cnt[good].clamp(min=1.0)
+    sst = sse_tot[good] - sum_y[good] ** 2 / c          # 该批内该站的离差平方和
+    # 方差闸门：近常数窗口（死水/缺测碎片）上 NSE 是爆炸量纲——分母趋零时
+    # 一点点误差被放大成天梯度的灾难点（首轮训练提升量冲到 -10 万就是
+    # 比特里溪这类缺测小站触发的）。全局标准化下 1.0 = 全域标准差，
+    # 窗口方差 < 1e-3（标准差 < 0.03）的水情没有预报意义，直接整站剔除。
+    var = sst / c
+    keep = var > 1e-3
+    if not keep.any():          # 整批都被闸门剔光时退化为只算逐步损失，保住数值稳定
+        zero = torch.zeros_like(quant)
+        return quant + pen, (quant, zero, pen)
+    sst = sst[keep].clamp(min=1e-9)
+    nse_sim = 1.0 - sse_sim[good][keep] / sst
+    nse_per = 1.0 - sse_per[good][keep] / sst
+    # 提升量截断 [-2, 1]：赢过完美（1.0）没有额外信息，输穿 -2 的灾难站
+    # 只保留 capped 梯度——它的绝对误差由逐步项继续惩罚，不许劫持整批梯度。
+    advantage = (nse_sim - nse_per).clamp(min=-2.0, max=1.0)
+    adv = -(adv_weight * advantage.mean())              # 要最大化提升量
+
+    return quant + adv + pen, (quant, adv, pen)
+
+
+def train_model_bptt(model, ds_tr, ds_va, m, out_dir, device):
+    """S.20 第二级训练循环：结构对照 train_model_unrolled，差别只在
+
+    - 每批样本整条 K 步轨迹只 backward 一次（计算图跨全部 K 步）；
+    - 损失是 unrolled_bptt_loss 的三项轨迹目标；
+    - 逐轮打印三项分解（逐步/提升量/漂移罚），方便看出模型在拿哪项换哪项。
+    """
+    K = int(m["unroll"])
+    lookback = ds_tr.lookback
+    use_spatial, use_future = ds_tr.use_spatial, ds_tr.use_future
+    output_mode = ds_tr.output_mode
+    every = max(1, int(m.get("unroll_every", 1)))
+    delta = float(m.get("huber_delta", 1.0))
+    bias_pen = float(m.get("bias_pen", 0.0))
+    bias_mode = str(m.get("bias_pen_mode", "abs"))
+    bias_over = float(m.get("bias_pen_over", 0.0))
+    adv_w = float(m.get("adv_weight", 1.0))
+    loss_name = str(m.get("loss", "quantile"))
+    taus = None
+    if loss_name == "quantile":
+        taus = torch.tensor([float(v) for v in m.get("quantiles", [0.1, 0.5, 0.9])],
+                            device=device)
+    bs, epochs = int(m["batch_size"]), int(m["epochs"])
+    opt = torch.optim.Adam(model.parameters(), lr=float(m["lr"]))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    ar = torch.arange(lookback, device=device)
+    flow_tr = torch.from_numpy(np.nan_to_num(ds_tr.flow_n, nan=0.0)).float().to(device)
+    fin_tr = torch.from_numpy(np.isfinite(ds_tr.flow_n)).to(device)
+    flow_va = torch.from_numpy(np.nan_to_num(ds_va.flow_n, nan=0.0)).float().to(device)
+    fin_va = torch.from_numpy(np.isfinite(ds_va.flow_n)).to(device)
+    w_all = torch.as_tensor(ds_tr.weights, device=device)
+    sam_tr = torch.as_tensor(ds_tr.samples, device=device)
+    sam_va = torch.as_tensor(ds_va.samples, device=device)
+    if every > 1:                                   # 闭环 K 步成本≈K 倍单步，
+        sam_tr = sam_tr[::every]                    # 抽稀训练样本把单轮耗时压回来；
+    cs_tr, st_tr = ds_tr.cs, ds_tr.statics          # 抽样密度对早停选模无偏，只是方差略升
+    cs_va, st_va = ds_va.cs, ds_va.statics
+    print(f"闭环 BPTT 训练 unroll={K}（每 {every} 取 1 样本，共 {len(sam_tr):,} 条）"
+          f"：整条轨迹不断梯度，adv_weight={adv_w} bias_pen={bias_pen}"
+          f"（{bias_mode}），逐步检查点保显存")
+
+    def run_train():
+        model.train(True)
+        perm = torch.randperm(len(sam_tr), device=device)
+        tot, n = 0.0, 0
+        parts = [0.0, 0.0, 0.0]
+        for j in range(0, len(sam_tr), bs):
+            sel = perm[j:j + bs]
+            s = sam_tr[sel]
+            opt.zero_grad()
+            loss, decomp = unrolled_bptt_loss(
+                model, s[:, 0], s[:, 1], flow_tr, fin_tr, cs_tr, st_tr,
+                w_all[sel], K, lookback, use_spatial, use_future, ar,
+                output_mode, taus, delta, bias_pen, adv_w, bias_mode,
+                bias_over)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tot += loss.item() * len(sel)
+            for i_, v in enumerate(decomp):
+                parts[i_] += v.item() * len(sel)
+            n += len(sel)
+        return tot / max(n, 1), [v / max(n, 1) for v in parts]
+
+    def run_val():
+        model.train(False)
+        tot, n = 0.0, 0
+        with torch.no_grad():
+            for j in range(0, len(sam_va), bs):
+                s = sam_va[j:j + bs]
+                w = torch.ones(len(s), device=device)
+                loss, _ = unrolled_bptt_loss(
+                    model, s[:, 0], s[:, 1], flow_va, fin_va, cs_va, st_va,
+                    w, K, lookback, use_spatial, use_future, ar,
+                    output_mode, taus, delta, bias_pen, adv_w, bias_mode,
+                    bias_over, use_ckpt=False)
+                tot += loss.item() * len(s)
+                n += len(s)
+        return tot / max(n, 1)
+
+    best, best_state, wait = np.inf, None, 0
+    for ep in range(1, epochs + 1):
+        tr, tr_parts = run_train()
+        sched.step()
+        va = run_val()
+        if va < best:
+            best, wait = va, 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            # 每刷新一次最优就落盘一次：闭环训练一轮要好几个小时，
+            # 只在收尾存盘的话，中途断电就整夜白训。最优权重才 0.7 MB，写得起。
+            torch.save(best_state, os.path.join(out_dir, "best.pt"))
+        else:
+            wait += 1
+        if ep % 5 == 0 or ep == 1:
+            print(f"  第 {ep:3d} 轮  训练 {tr:.4f}（逐步 {tr_parts[0]:.4f} "
+                  f"提升量 {-tr_parts[1]:+.4f} 漂移罚 {tr_parts[2]:.4f}）"
+                  f"  验证 {va:.4f}", flush=True)
         if wait >= int(m["patience"]):
             print(f"  第 {ep} 轮早停")
             break
@@ -606,8 +938,11 @@ def train_model(model, ldr, m, out_dir, device):
             # 逐样本按有效点平均，再与权重逐样本相乘（分位数路 K 个头各自计点，
             # 与旧口径 mean(H,K) 一致，保证验证损失跨方案可比；完全无有效目标的
             # 样本整体剔除，不计 0 损失拖低均值）
+            # l 在分位数损失下为 (B,H,K)，在单头损失下为 (B,H)；
+            # 按损失张量自身的维度求和，避免单头路径多取一个不存在的 K 维。
+            loss_dims = tuple(range(1, l.ndim))
             K = pred.shape[-1] if loss_name == "quantile" else 1
-            ls = l.sum(dim=ldims) / (cnt * K)
+            ls = l.sum(dim=loss_dims) / (cnt * K)
             if train:
                 wm = w * has
                 loss = (ls * wm).sum() / wm.sum().clamp(min=1e-9)
@@ -630,6 +965,10 @@ def train_model(model, ldr, m, out_dir, device):
         if va < best:
             best, wait = va, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            # 每刷新一次最优就落盘一次。这个循环可能跑好几个小时（S.18 每轮 5.2 分钟、
+            # 上百轮），只在收尾时存盘的话，中途断电或进程被杀就整夜白训。最优权重
+            # 才 0.7 MB，写得起。
+            torch.save(best_state, os.path.join(out_dir, "best.pt"))
         else:
             wait += 1
         if ep % 5 == 0 or ep == 1:
@@ -648,8 +987,13 @@ def main():
     ap.add_argument("--set", action="append", default=[], metavar="key=value")
     ap.add_argument("--eval-only", action="store_true",
                     help="跳过训练，直接加载 out_dir/best.pt 评估")
+    ap.add_argument("--init-from", default=None, metavar="best.pt",
+                    help="热启动：从指定权重继续训练（等价于延长训练计划），"
+                         "输出目录仍写 out_dir，不影响被加载的源权重")
     args = ap.parse_args()
     cfg = apply_overrides(load_config(os.path.join(ROOT, args.config)), args.set)
+    # 先核对轻量元数据，再加载任何大数组；错误时在占用几十 GB 内存前退出。
+    contract = validate_data_contract(cfg, ROOT)
 
     m = cfg["model"]
     lookback, horizon = int(m["lookback"]), int(m["horizon"])
@@ -667,9 +1011,8 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    ids, names, areas, times, area_rain, flow = load_inputs(cfg)
-    mask1km = np.load(os.path.join(ROOT, cfg["paths"]["catchments"]),
-                      allow_pickle=True)["mask1km"].astype(np.float32)
+    ids, names, areas, times, area_rain, flow = load_inputs(cfg, contract)
+    mask1km = contract.mask1km
     statics = build_statics(cfg, mask1km)
     n_site, T = flow.shape
     print(f"断面 {n_site} 个  时间轴 {times[0]} ~ {times[-1]}  共 {T} 小时")
@@ -677,8 +1020,15 @@ def main():
     cs = None
     if use_spatial:
         import xarray as xr
+        # 延长后的逐小时 float32 网格约 20 GB。若把 astype / nan_to_num /
+        # cumsum 串成一条表达式，多个全尺寸临时数组会同时驻留并撑爆内存。
+        # 因此逐步原地处理，并在累计和生成后立即释放原始网格。
         rain_grid = xr.open_dataset(os.path.join(ROOT, cfg["paths"]["rain_nc"]))["rain"].values
-        cs = np.nan_to_num(rain_grid.astype(np.float32), nan=0.0).cumsum(axis=0)
+        if rain_grid.dtype != np.float32:
+            rain_grid = rain_grid.astype(np.float32)   # 已是 float32 就别白复制 20 GB
+        np.nan_to_num(rain_grid, copy=False, nan=0.0)
+        cs = np.cumsum(rain_grid, axis=0)
+        del rain_grid
         print(f"累积降雨数组 {cs.shape}  {cs.nbytes / 1e9:.2f} GB")
 
     n_win = T - lookback - R + 1
@@ -766,6 +1116,12 @@ def main():
         samples[sp] = ss
         print(f"{sp:5s} {len(ss)} 个样本")
 
+    split_info = assert_calendar_splits(samples, times, lookback, R)
+    train_boundary = int(times.searchsorted(pd.Timestamp("2023-01-01")))
+    if not 0 < n_tr <= train_boundary:
+        raise AssertionError(f"标准化截止下标越出训练段：{n_tr} > {train_boundary}")
+    normalization_end = times[n_tr] if n_tr < T else times[-1] + pd.Timedelta(hours=1)
+
     # E1：逐站方差归一化损失权重 = 全站平均方差 / 本站方差（裁剪防极端）
     w_train = None
     if str(m.get("loss")) == "huber_nse":
@@ -777,11 +1133,31 @@ def main():
 
     masked_pool = bool(m.get("masked_pool", False))
     delta_cap = float(m.get("delta_cap", 0.0))
+    # S.14：输出语义开关。level = 直接输出下一时刻的流量数值本身，不做 diff。
+    output_mode = str(m.get("output_mode", "delta"))
+    if output_mode not in ("delta", "level"):
+        raise ValueError(f"未知 output_mode：{output_mode!r}")
+    if output_mode == "level" and delta_cap > 0:
+        # 增量限幅的语义是"单步增量不超过 ±delta_cap"，套到流量数值上会把输出
+        # 压在 0 附近，直接毁掉模型。必须显式关掉，不能默默沿用。
+        raise ValueError("output_mode=level 时 delta_cap 必须为 0")
+    # 闭环滚动训练（unroll>0）现已同时支持 delta 与 level 两种输出语义
+    # （unrolled_steps 按 output_mode 区分真值口径与回灌方式），分位数损失经
+    # taus 传入。注意闭环验证损失是滚动多步的 pinball/huber，数值与单步
+    # 教师强迫不可比，早停只在闭环口径内部自洽。
+    # cs 是 GB 级的大数组，且 train/val/test 三个数据集共用同一个对象。若交给
+    # 各自的加载器分别 .to(device)，显存里会留下三份拷贝：S.14 的 7.6 年是
+    # 3×5.5 GB，侥幸没爆；训练段延长到 1990 年后单份就是 18.7 GiB，三份必炸。
+    # 所以在这里统一搬一次，三个数据集共享同一个显存张量。
+    if device.type == "cuda":
+        if cs is not None:
+            cs = torch.from_numpy(cs).to(device)
+        statics = torch.from_numpy(statics).to(device)
     ds = {k: SiteDataset(cs, statics, flow_n, rain_n, v,
                          use_spatial, use_future, horizon, lookback,
                          weights=w_train if k == "train" else None,
                          areal=(str(m.get("arch", "net")) == "dlinear"),
-                         mask_ch=masked_pool)
+                         mask_ch=masked_pool, output_mode=output_mode)
           for k, v in samples.items()}
     ldr = {k: make_loader(v, int(m["batch_size"]), shuffle=(k == "train"),
                           device=device) for k, v in ds.items()}
@@ -826,18 +1202,52 @@ def main():
           + (f"  掩膜池化 开" if masked_pool else "")
           + (f"  增量限幅{delta_cap:g}σ" if delta_cap > 0 else "")
           + (f"  分位数×{n_quant}" if n_quant > 1 else "")
+          + (f"  输出 流量数值" if output_mode == "level" else "  输出 增量")
           + (f"  单步+滚动{rollout}h" if rollout else ""))
 
     out_dir = os.path.join(ROOT, cfg["paths"]["out_dir"])
+    manifest_path = Path(out_dir) / "training_manifest.json"
+    # init-from 是有意的续训（延长训练计划），允许 out_dir 已有 best.pt；
+    # 其余情况照旧拒绝覆盖，防止手滑冲掉一整夜训练成果。
+    if not args.eval_only and not args.init_from and (Path(out_dir) / "best.pt").exists():
+        raise FileExistsError(f"输出目录已有 best.pt，拒绝覆盖：{out_dir}")
+    if args.eval_only and not manifest_path.is_file():
+        raise FileNotFoundError(f"评估要求训练清单，但找不到：{manifest_path}")
+    if args.eval_only:
+        with open(manifest_path, encoding="utf-8") as f:
+            saved_manifest = json.load(f)
+        if saved_manifest.get("format") != MANIFEST_FORMAT:
+            raise ValueError(
+                f"评估要求 {MANIFEST_FORMAT} 训练清单；旧模型请重新训练")
+        if saved_manifest.get("data_signature") != contract.signature:
+            raise ValueError("当前数据签名与训练清单不一致，拒绝评估")
     os.makedirs(out_dir, exist_ok=True)
+    if not args.eval_only:
+        write_training_manifest(
+            manifest_path, contract=contract, split_info=split_info,
+            normalization_end_exclusive=normalization_end, config=cfg,
+            extra={"lookback": lookback, "prediction_steps": R,
+                   "normalization_prefix_end_index": n_tr})
+        print(f"训练清单已写 {manifest_path}，数据签名 {contract.signature}")
     if args.eval_only:
         model.load_state_dict(torch.load(os.path.join(out_dir, "best.pt"),
                                          map_location=device))
         print(f"已加载 {out_dir}/best.pt，跳过训练")
-    elif int(m.get("unroll", 0)):
-        train_model_unrolled(model, ds["train"], ds["val"], m, out_dir, device)
     else:
-        train_model(model, ldr, m, out_dir, device)
+        if args.init_from:
+            # 热启动：先载入权重，再继续走正常训练分发——注意必须是"加载后
+            # 继续训"，不是"加载后跳过训"（此前 elif 链把它放进了互斥分支，
+            # 热启动会变成纯评估，是个潜伏 bug，S.20 第二级热启动时修掉）。
+            src = (args.init_from if os.path.isabs(args.init_from)
+                   else os.path.join(ROOT, args.init_from))
+            model.load_state_dict(torch.load(src, map_location=device))
+            print(f"热启动：已从 {src} 载入权重，新训练计划重新开始计时")
+        if int(m.get("unroll", 0)) and bool(m.get("bptt", False)):
+            train_model_bptt(model, ds["train"], ds["val"], m, out_dir, device)
+        elif int(m.get("unroll", 0)):
+            train_model_unrolled(model, ds["train"], ds["val"], m, out_dir, device)
+        else:
+            train_model(model, ldr, m, out_dir, device)
     # ---------- 评估 ----------
     model.eval()
 
@@ -852,8 +1262,13 @@ def main():
                                           for t in (x, hist, frain, idx, y))
                 dl = model(x, hist, frain, idx)[:, :, model.mid]
                 anchor = hist[:, -1, 0:1]
-                fo.append((y + anchor).cpu().numpy())
-                fs.append((dl + anchor).cpu().numpy())
+                # level 模式下 y 和模型输出本身就已经是流量数值，不能再加锚点
+                if output_mode == "level":
+                    fo.append(y.cpu().numpy())
+                    fs.append(dl.cpu().numpy())
+                else:
+                    fo.append((y + anchor).cpu().numpy())
+                    fs.append((dl + anchor).cpu().numpy())
                 fi.append(idx.cpu().numpy())
         fo, fs, fi = map(np.concatenate, (fo, fs, fi))
         print("\n训练段拟合（单步，教师强迫）")
@@ -911,14 +1326,16 @@ def main():
                             # 滚动时刻 t 的 3 个面雨量标量，与训练集 __getitem__ 同式
                             lo2 = max(0, t - 71)
                             fut = torch.stack([rain_t[idx, t],
-                                               rain_t[idx, lo2:t + 1].mean(dim=1),
+                                               rain_t[idx, lo2:t + 1].sum(dim=1),
                                                rain_t[idx, t + 1]], 1)
                             if not use_future:
                                 fut = torch.cat(
                                     [fut[:, :2],
                                      torch.zeros(B, 1, device=device)], 1)
                     hist = cur.unsqueeze(-1)              # (B, LB, 1) 仅流量
-                    nxt = cur[:, -1] + model(x, hist, fut, idx)[:, 0, model.mid]
+                    out = model(x, hist, fut, idx)[:, 0, model.mid]
+                    # level：模型输出就是流量数值本身，绝不能再加一次当前流量
+                    nxt = out if output_mode == "level" else cur[:, -1] + out
                     cur = torch.cat([cur[:, 1:], nxt.unsqueeze(1)], 1)
                     sims.append(nxt)
                 sim_l.append(torch.stack(sims, 1).cpu().numpy())
@@ -931,10 +1348,14 @@ def main():
             for x, hist, frain, idx, y, _w in ldr["test"]:
                 x, hist, frain, idx, y = (t.to(device)
                                           for t in (x, hist, frain, idx, y))
-                delta = model(x, hist, frain, idx)[:, :, model.mid]   # 中位分位点
-                anchor = hist[:, -1, 0:1]
-                obs_l.append((y + anchor).cpu().numpy())
-                sim_l.append((delta + anchor).cpu().numpy())
+                pred = model(x, hist, frain, idx)[:, :, model.mid]   # 中位分位点
+                if output_mode == "level":
+                    obs_l.append(y.cpu().numpy())
+                    sim_l.append(pred.cpu().numpy())
+                else:
+                    anchor = hist[:, -1, 0:1]
+                    obs_l.append((y + anchor).cpu().numpy())
+                    sim_l.append((pred + anchor).cpu().numpy())
                 site_l.append(idx.cpu().numpy())
         t0_l.append(np.array([t0 for _, t0 in samples["test"]], dtype=np.int64))
     obs_n, sim_n = np.concatenate(obs_l), np.concatenate(sim_l)
@@ -1061,6 +1482,7 @@ def main():
         ids=np.array(ids), names=np.array(names), areas=areas,
         transform=np.array(transform),
         lams=np.array(lams if lams is not None else np.full(n_site, np.nan)),
+        output_mode=np.array(output_mode),
     )
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

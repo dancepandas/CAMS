@@ -1,0 +1,56 @@
+basin:
+  grid: 128
+  lat_max: 36.335
+  lat_min: 35.065
+  lon_max: -82.215
+  lon_min: -83.485
+  name: french_broad
+  step: 0.01
+fetch:
+  proxy: http://127.0.0.1:7890
+  rain_checkpoint_minutes: 10
+  rain_products:
+  - name: GaugeCorr_QPE_01H
+    until: 2020-10-14 12:00
+  - name: MultiSensor_QPE_01H_Pass2
+  rain_threads: 32
+model:
+  batch_size: 128
+  cum_hours:
+  - 1
+  - 3
+  - 6
+  - 12
+  - 24
+  - 72
+  epochs: 40
+  hidden: 96
+  horizon: 24
+  lookback: 72
+  lr: 0.001
+  patience: 12
+  seed: 42
+  spatial_dim: 48
+  split:
+  - 0.7
+  - 0.15
+  - 0.15
+  split_dates:
+  - '2023-01-01'
+  - '2024-01-01'
+  stride: 24
+  use_future_rain: true
+  use_site: false
+  use_spatial: true
+paths:
+  area_rain: data/area_rain_1990_2024.npz
+  catchments: data/catchments.npz
+  dem30: data/dem30
+  out_dir: runs/site_model
+  rain_nc: data/rain_1990_2024.nc
+  sites: data/sites
+  sites_csv: configs/sites_french_broad.csv
+  terrain: data/terrain30.npz
+period:
+  end: '2024-12-31 23:00'
+  start: '1990-01-01 00:00'

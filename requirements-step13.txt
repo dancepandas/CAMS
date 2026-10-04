@@ -1,0 +1,7 @@
+# S.13 核心与测试环境；数据处理全流程仍以项目 README 为准。
+numpy
+pandas
+PyYAML
+torch
+xarray
+netCDF4

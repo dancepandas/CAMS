@@ -12,8 +12,8 @@ basin:
   step: 0.01           # 网格步长（度），0.01 度约合 1 公里
 
 period:
-  start: "2015-06-01"
-  end: "2024-12-31"
+  start: "2015-06-01 00:00"
+  end: "2024-12-31 23:00"
 
 paths:
   sites: data/sites                 # 各断面流量 CSV
@@ -30,6 +30,7 @@ model:
   horizon: 24           # 预见期（小时）
   stride: 24            # 训练集抽样步长
   split: [0.7, 0.15, 0.15]
+  split_dates: ["2023-01-01", "2024-01-01"]
   hidden: 96
   spatial_dim: 48
   batch_size: 128

@@ -36,6 +36,9 @@ MODELS = [  # 与 plot_compare.py 同步
     ("S.10 MoE双专家", "runs/site_model_moe", "#1b9e77"),
     ("S.11 MoE+掩膜池", "runs/site_model_moe_mp", "#e7298a"),
     ("S.12 MoE+滑窗3h", "runs/site_model_step12", "#d73027"),
+    # S.13 尚未训练时会在下面安静跳过；两个入口分别保留，便于对照 control/PPO。
+    ("S.13 闭环对照", "runs/site_model_s13_control", "#e6ab02"),
+    ("S.13 PPO", "runs/site_model_s13_ppo", "#1f78b4"),
 ]
 LOOKBACK = 72
 LEADS = [1, 3, 6, 12, 24]  # 画连续提前量曲线的步数（小时）
@@ -44,8 +47,8 @@ LEAD_COL = {1: "#a50026", 3: "#f46d43", 6: "#fdae61", 12: "#74add1", 24: "#4575b
 
 
 def load_run(run_dir):
-    # 优先用逐小时密集推理产物（真连续曲线）；否则退回 24h 网格的存档预报
-    for fn in ("predictions_dense.npz", "predictions.npz"):
+    # 优先用逐小时密集推理产物（真连续曲线）；S.13 验证/测试文件名带分段后缀。
+    for fn in ("predictions_dense_test.npz", "predictions_dense.npz", "predictions.npz"):
         pth = os.path.join(ROOT, run_dir, fn)
         if os.path.isfile(pth):
             p = np.load(pth, allow_pickle=True)
@@ -101,10 +104,16 @@ def main():
 
     runs = []
     for lab, rd, col in models:
-        if os.path.isfile(os.path.join(ROOT, rd, "predictions.npz")):
+        has_prediction = any(os.path.isfile(os.path.join(ROOT, rd, fn)) for fn in
+                             ("predictions_dense_test.npz", "predictions_dense.npz",
+                              "predictions.npz"))
+        if has_prediction:
             runs.append((lab, load_run(rd), col))
         else:
             print(f"跳过（尚无预测文件）：{lab} {rd}")
+    if not runs:
+        print("没有可画的预测文件，结束")
+        return
 
     a = np.load(os.path.join(ROOT, "data", "area_rain.npz"), allow_pickle=True)
     area_rain = a["area_rain"].astype(np.float64)
